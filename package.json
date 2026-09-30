@@ -1,10 +1,13 @@
 {
   "name": "8star-chat",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "White-label live event chat with moderation and stage monitor",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+    "check:i18n": "node scripts/check-i18n.js",
+    "loadtest": "node scripts/loadtest.js"
   },
   "engines": {
     "node": ">=22"

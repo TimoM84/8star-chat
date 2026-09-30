@@ -2,4 +2,7 @@
 .env
 node_modules
 data
+test
+scripts
 *.zip
+*.md
