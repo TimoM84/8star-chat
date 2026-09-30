@@ -1,9 +1,9 @@
 services:
   8star-chat:
     build:
-      context: https://github.com/TimoM84/8star-chat.git#v0.3.0
+      context: https://github.com/TimoM84/8star-chat.git#v0.4.0
       dockerfile: Dockerfile
-    image: 8star-chat:0.3.0
+    image: 8star-chat:0.4.0
     restart: unless-stopped
     ports:
       - "9876:3000"
