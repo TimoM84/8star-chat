@@ -1,28 +1,23 @@
 services:
   8star-chat:
-    build: .
-    image: 8star-chat:0.1.0
-    container_name: 8star-chat
+    build:
+      context: https://github.com/TimoM84/8star-chat.git#v0.2.0
+      dockerfile: Dockerfile
+    image: 8star-chat:0.2.0
     restart: unless-stopped
     ports:
-      - "3088:3000"
+      - "9876:3000"
     environment:
-      PORT: 3000
+      PORT: "3000"
       DATA_DIR: /data
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in the Dockhand stack environment}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in Dockhand}
       DEFAULT_MAX_USERS: ${DEFAULT_MAX_USERS:-10000}
       MAX_MESSAGE_LENGTH: ${MAX_MESSAGE_LENGTH:-500}
       ROOM_PUBLISH_PER_SECOND: ${ROOM_PUBLISH_PER_SECOND:-5}
-      FRAME_ANCESTORS: ${FRAME_ANCESTORS:-*}
+      FRAME_ANCESTORS: "${FRAME_ANCESTORS:-*}"
     volumes:
       - 8star_chat_data:/data
-    networks:
-      - chat_net
 
 volumes:
   8star_chat_data:
-
-networks:
-  chat_net:
-    driver: bridge
