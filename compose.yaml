@@ -1,9 +1,9 @@
 services:
   8star-chat:
     build:
-      context: https://github.com/TimoM84/8star-chat.git#v0.4.0
+      context: https://github.com/TimoM84/8star-chat.git#v0.5.0
       dockerfile: Dockerfile
-    image: 8star-chat:0.4.0
+    image: 8star-chat:0.5.0
     restart: unless-stopped
     ports:
       - "9876:3000"
@@ -16,6 +16,7 @@ services:
       MAX_MESSAGE_LENGTH: ${MAX_MESSAGE_LENGTH:-500}
       ROOM_PUBLISH_PER_SECOND: ${ROOM_PUBLISH_PER_SECOND:-5}
       FRAME_ANCESTORS: "${FRAME_ANCESTORS:-*}"
+      TRUST_PROXY: ${TRUST_PROXY:-true}
     volumes:
       - 8star_chat_data:/data
 
