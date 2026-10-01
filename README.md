@@ -45,52 +45,75 @@
 - Requests that use a session must also send that session's CSRF token (`x-csrf-token`). No CORS access is granted.
 - Error messages are generic and do not reveal private data, session details or whether an account exists.
 
+## Sending messages: what an answer means
+
+Every message from an attendee carries a random `clientMessageId` chosen by the browser. The server answers:
+
+| Answer                      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `201`                       | The message was **accepted and written to the message journal on disk** (`fdatasync`, unless `JOURNAL_FSYNC=false`). It is part of the chat and queued for live delivery, in order. It is not yet guaranteed that every reader has received it: delivery to open streams follows within about `FANOUT_INTERVAL_MS` plus the time to write to all connections. Readers that connect later get it from the recent history. |
+| `200` with `replayed: true` | The same `clientMessageId` was already accepted for this session; the original message is returned and no copy is made.                                                                                                                                                                                                                                                                                                  |
+| `429`                       | Refused by a limit (5 seconds per attendee, `ROOM_PUBLISH_PER_SECOND` per event). Nothing was stored. `Retry-After` says when to try again.                                                                                                                                                                                                                                                                              |
+| `503`                       | Refused because the server is overloaded or the journal could not be written. Nothing was stored. `Retry-After` says when to try again.                                                                                                                                                                                                                                                                                  |
+| `409`                       | The `clientMessageId` was already used for a different text.                                                                                                                                                                                                                                                                                                                                                             |
+
+A message is **never shown before it is stored**, and it is stored before `201` is sent. When the browser gets no answer (time-out, connection lost, `502`/`504` from the proxy), it asks `GET /api/events/<slug>/messages/status?clientMessageId=…` (answers `accepted`, `pending` or `unknown`, only for the same session and without message text) and retries with the same id. Retries therefore never create duplicates. The idempotency record is kept with the message, so it also survives a restart.
+
 ## Install or update on the server
 
-The Compose file uses the image `8star-chat:0.6.0`, which is built on the Docker host from this source (`pull_policy: never`). The release ZIP contains the source; build it on the server, then update the existing Dockhand stack:
+The Compose file uses the image `8star-chat:0.7.0`, which is built on the Docker host from this source (`pull_policy: never`). Build it on the server, then update the existing stack:
 
 ```sh
-unzip 8star-chat-v0.6.0.zip -d 8star-chat-v0.6.0
-docker build -t 8star-chat:0.6.0 8star-chat-v0.6.0
+python3 -m zipfile -e 8star-chat-v0.7.0.zip .
+docker build -t 8star-chat:0.7.0 8star-chat-v0.7.0
 ```
 
-In Dockhand, open the **existing** 8star Chat stack, replace its Compose file with `compose.yaml` from this release and redeploy. Keep the stack name, the service name `8star-chat` and the volume name `8star_chat_data` unchanged: Docker Compose prefixes the volume with the stack name, so a new stack name would start with an empty volume. Keep the stack's existing environment values (`ADMIN_PASSWORD`, `ADMIN_EMAIL`, …).
+Replace the stack's Compose file with `compose.yaml` from this release and redeploy. Keep the stack (project) name, the service name `8star-chat` and the volume name `8star_chat_data` unchanged: Docker Compose prefixes the volume with the project name, so a new name would start with an empty volume. Keep the existing environment values (`ADMIN_PASSWORD`, `ADMIN_EMAIL`, `ROOM_PUBLISH_PER_SECOND`, …).
 
-Back up the data volume before every update (the release notes contain exact commands). Stopping the container is not required for a copy, but a backup taken while it is stopped is guaranteed to be consistent.
+Back up the data volume before every update. A backup taken while the container is stopped is guaranteed to be consistent.
 
-**Building from Git instead:** after this release is pushed with the tag `v0.6.0`, the image can also be built by Compose, as in earlier versions. Replace `image:`/`pull_policy:` with:
+**Building from Git instead:** after this release is pushed with the tag `v0.7.0`, Compose can build the image itself. Replace `image:`/`pull_policy:` with:
 
 ```yaml
 build:
-  context: https://github.com/TimoM84/8star-chat.git#v0.6.0
+  context: https://github.com/TimoM84/8star-chat.git#v0.7.0
   dockerfile: Dockerfile
-image: 8star-chat:0.6.0
+image: 8star-chat:0.7.0
 ```
 
-The app is reachable at `https://onlinechat.8star.nl/` when that domain's reverse proxy points to port `9876`. Configure the proxy for long-lived Server-Sent Events connections without buffering, and let it pass `Host` (or `X-Forwarded-Host`), `X-Forwarded-Proto` and `X-Forwarded-For`.
+The app listens on port `9876` of the Docker host. Configure the reverse proxy for long-lived Server-Sent Events connections without buffering, and let it pass `Host` (or `X-Forwarded-Host`), `X-Forwarded-Proto` and `X-Forwarded-For`. Every connected attendee uses up to four proxy connections over HTTP/1.1 (stream and request connection on the browser side, and their upstream connections); size the proxy's `worker_connections` × `worker_processes` accordingly (see _Capacity and limitations_).
 
 ### Settings
 
-| Variable                      | Default             | Meaning                                                                                                                                                                                               |
-| ----------------------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ADMIN_EMAIL`                 | `admin@example.com` | Platform admin e-mail for the first start.                                                                                                                                                            |
-| `ADMIN_PASSWORD`              | – (required)        | Platform admin password for the first start, at least 12 characters. Changing it later does not change the stored password.                                                                           |
-| `PORT`                        | `3000`              | Port inside the container.                                                                                                                                                                            |
-| `DATA_DIR`                    | `/data`             | Data directory (the volume).                                                                                                                                                                          |
-| `DEFAULT_MAX_USERS`           | `10000`             | Default participant limit for new events.                                                                                                                                                             |
-| `MAX_MESSAGE_LENGTH`          | `500`               | Maximum message length.                                                                                                                                                                               |
-| `ROOM_PUBLISH_PER_SECOND`     | `5`                 | Maximum public publications per event per second.                                                                                                                                                     |
-| `FRAME_ANCESTORS`             | `*`                 | Origins that may embed the chat (space-separated), e.g. `https://live.example.com`.                                                                                                                   |
-| `TRUST_PROXY`                 | `true` in Compose   | Trust `X-Forwarded-For`/`-Proto`/`-Host`. Enable only behind a reverse proxy that sets these headers. Needed for IP blocking and for detecting HTTPS.                                                 |
-| `COOKIE_SECURE`               | `auto`              | `auto` marks cookies `Secure` when the request arrived over HTTPS (directly, or per `X-Forwarded-Proto` with `TRUST_PROXY=true`). Use `true` to always require HTTPS; `false` only for local testing. |
-| `ALLOWED_ORIGINS`             | empty               | Extra origins allowed to send state-changing requests. Normally empty.                                                                                                                                |
-| `GUEST_SESSION_HOURS`         | `24`                | Lifetime of an attendee session.                                                                                                                                                                      |
-| `PRIVATE_UNLOCK_IDLE_SECONDS` | `900`               | Idle time after which a private conversation locks again.                                                                                                                                             |
-| `PIN_LOCK_SECONDS`            | `900`               | Wait time after 5 wrong PINs.                                                                                                                                                                         |
-| `MAX_GUEST_SESSIONS`          | `200000`            | Safety limit for stored attendee sessions.                                                                                                                                                            |
-| `HEARTBEAT_SECONDS`           | `20`                | Interval of the keep-alive comment on open streams.                                                                                                                                                   |
+| Variable                      | Default               | Meaning                                                                                                                                                                                               |
+| ----------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ADMIN_EMAIL`                 | `admin@example.com`   | Platform admin e-mail for the first start.                                                                                                                                                            |
+| `ADMIN_PASSWORD`              | – (required)          | Platform admin password for the first start, at least 12 characters. Changing it later does not change the stored password.                                                                           |
+| `PORT`                        | `3000`                | Port inside the container.                                                                                                                                                                            |
+| `DATA_DIR`                    | `/data`               | Data directory (the volume).                                                                                                                                                                          |
+| `DEFAULT_MAX_USERS`           | `10000`               | Default participant limit for new events.                                                                                                                                                             |
+| `MAX_MESSAGE_LENGTH`          | `500`                 | Maximum message length.                                                                                                                                                                               |
+| `ROOM_PUBLISH_PER_SECOND`     | `5`                   | Maximum public publications per event per second.                                                                                                                                                     |
+| `FRAME_ANCESTORS`             | `*`                   | Origins that may embed the chat (space-separated), e.g. `https://live.example.com`.                                                                                                                   |
+| `TRUST_PROXY`                 | `true` in Compose     | Trust `X-Forwarded-For`/`-Proto`/`-Host`. Enable only behind a reverse proxy that sets these headers. Needed for IP blocking and for detecting HTTPS.                                                 |
+| `COOKIE_SECURE`               | `auto`                | `auto` marks cookies `Secure` when the request arrived over HTTPS (directly, or per `X-Forwarded-Proto` with `TRUST_PROXY=true`). Use `true` to always require HTTPS; `false` only for local testing. |
+| `ALLOWED_ORIGINS`             | empty                 | Extra origins allowed to send state-changing requests. Normally empty.                                                                                                                                |
+| `GUEST_SESSION_HOURS`         | `24`                  | Lifetime of an attendee session.                                                                                                                                                                      |
+| `PRIVATE_UNLOCK_IDLE_SECONDS` | `900`                 | Idle time after which a private conversation locks again.                                                                                                                                             |
+| `PIN_LOCK_SECONDS`            | `900`                 | Wait time after 5 wrong PINs.                                                                                                                                                                         |
+| `MAX_GUEST_SESSIONS`          | `200000`              | Safety limit for stored attendee sessions.                                                                                                                                                            |
+| `HEARTBEAT_SECONDS`           | `20`                  | Interval of the keep-alive comment on open streams.                                                                                                                                                   |
+| `JOURNAL_FSYNC`               | `true`                | Flush the message journal to disk (`fdatasync`) before a message is confirmed. `false` keeps it in the OS cache only (survives an app crash, not a power or host failure).                            |
+| `FANOUT_INTERVAL_MS`          | `100`                 | Live updates to attendees are written at most once per connection per interval (the first update after a quiet period goes out immediately).                                                          |
+| `FANOUT_SLICE`                | `500`                 | Connections written per step before the server serves other requests again.                                                                                                                           |
+| `SSE_MAX_BUFFER_KB`           | `256`                 | A stream whose unsent data exceeds this is closed (the browser reconnects and gets the recent history).                                                                                               |
+| `OVERLOAD_LAG_MS`             | `1000`                | New messages are refused with 503 while the server has been unable to run a timer for this long.                                                                                                      |
+| `MAX_PENDING_MESSAGES`        | `1000`                | Messages that may wait for the journal at the same time; more are refused with 503.                                                                                                                   |
+| `MAX_PENDING_EVENTS`          | `5000`                | Live updates that may wait per event; new messages are refused with 503 when the queue is (nearly) full.                                                                                              |
+| `LISTEN_BACKLOG`              | `4096`                | Accept queue of the listening socket (capped by the kernel's `net.core.somaxconn`).                                                                                                                   |
+| `METRICS_LOG_SECONDS`         | `0` (`60` in Compose) | Write one JSON metrics line to the container log every N seconds (counts and timings only; no message text, names, cookies or tokens). `0` disables it.                                               |
 
-The named volume `8star_chat_data` holds `state.json` (events, accounts, messages), `guest-sessions.json` (hashed attendee sessions and PIN hashes), `ip-block-key` (key for keyed IP hashes; raw IP addresses are not stored) and `session-key` (key for CSRF tokens). Keep a separate backup. IP blocking applies to everyone sharing that public IP, such as people on the same venue Wi-Fi. The CSV export is available in the moderator console under **Published / archive** and **Settings**. Export it before removing the stack or its volume.
+The named volume `8star_chat_data` holds `state.json` (events, accounts, messages), `messages-N.journal` (messages confirmed since the last `state.json` snapshot; replayed at start-up and removed after the next snapshot), `guest-sessions.json` (hashed attendee sessions and PIN hashes), `ip-block-key` (key for keyed IP hashes; raw IP addresses are not stored) and `session-key` (key for CSRF tokens). Keep a separate backup. IP blocking applies to everyone sharing that public IP, such as people on the same venue Wi-Fi. The CSV export is available in the moderator console under **Published / archive** and **Settings**. Export it before removing the stack or its volume.
 
 ## Routes
 
@@ -117,27 +140,44 @@ The named volume `8star_chat_data` holds `state.json` (events, accounts, message
 
 ```sh
 npm ci
-npm test              # privacy, sessions, PIN, CSRF/Origin, translations, configuration, migration
+npm test              # privacy, sessions, PIN, CSRF/Origin, translations, configuration, migration,
+                      # overload/idempotency/journal/delivery behaviour
 npm run check:i18n    # missing, unused or untranslated interface texts
-npm run loadtest -- 2000 10   # local load test: attendees, messages
 ```
+
+Load tests (`scripts/loadtest.js`, no dependencies) run against any URL — a local server or the public address through the proxy — and end every test session afterwards (also when interrupted; test sessions additionally expire after 30 minutes):
+
+```sh
+node scripts/loadtest.js --url https://chat.example.com --event testevent --attendees 5000 --scenario join  --workers 4
+node scripts/loadtest.js --url https://chat.example.com --event testevent --attendees 5000 --scenario burst --workers 4
+node scripts/loadtest.js --url https://chat.example.com --event testevent --attendees 2000 --scenario stream --senders 50 --duration 4.5
+```
+
+The report separates join time, HTTP statuses, client time-outs, unique message ids actually published (seen on the live streams), messages published without a success answer, duplicates, expected and received deliveries, fan-out latency, unexpected disconnects and the CPU and event-loop delay of the load generator itself. `scripts/probe.js` (`node -r ./scripts/probe.js server.js`) measures event-loop delay, CPU, memory, accept-queue overflows and per-request timings of any server version. See `docs/load-testing.md`.
 
 Translations live in `public/i18n-core.js` (English text is the key, followed by Dutch, German and French). `npm run check:i18n` fails when an interface text or server message has no translation, when a key is unused, or when a row is incomplete. Code is formatted with Prettier (`npx prettier --write .`).
 
 ## Capacity and limitations
 
-**Measured (not a guarantee).** `scripts/loadtest.js` was run on a 2-vCPU / 8 GB Linux sandbox with Node 22, client and server on the same machine, without reverse proxy, TLS or real browsers:
+**What limited v0.6.0 (measured).** With 5,000 connected attendees in an open chat, every accepted message was written to every connection inside the request (`res.write` per connection). A CPU profile showed 13.9 s in the `writev` system call during a burst; one write to 5,000 connections costs 60–95 ms, almost all of it the system call, and ten messages in one write cost the same as one. At `ROOM_PUBLISH_PER_SECOND=50` that needs ~3.75 s of work per second, so requests queued inside the server (24 s without being read), the accept queue overflowed (default 511), and the proxy reported `Connection reset by peer` and `upstream timed out … while reading response header`. Messages that the server accepted late were published while the sender had already timed out.
 
-|                                                              | v0.5.0         | v0.6.0               |
-| ------------------------------------------------------------ | -------------- | -------------------- |
-| 8,000 attendees join and connect                             | 17.0 s (470/s) | 6.5 s (1,233/s)      |
-| Delivery of a published question to all 8,000 (p95 of 5)     | 179 ms         | 167 ms               |
-| Server memory with 8,000 connected                           | 189 MB         | 205 MB               |
-| 2,000 attendees (v0.6.0): join/connect, delivery p95, memory |                | 2.3 s, 43 ms, 127 MB |
+**What v0.7.0 does.** Messages are confirmed after the journal write, not after the fan-out. Live updates are queued per event and written in batches (one write per connection per `FANOUT_INTERVAL_MS`) in slices, so the server keeps answering requests while it delivers. Limits answer immediately with `429`/`503` and `Retry-After`; queues are bounded (`MAX_PENDING_MESSAGES`, `MAX_PENDING_EVENTS`, `SSE_MAX_BUFFER_KB`); the accept queue is 4,096. The public message event sent to attendees is 30 % smaller (206 instead of 294 bytes for an 80-character message). The join answer carries the first stream ticket (one round trip less), static files are served compressed with ETags.
 
-These numbers show the application itself is not the first bottleneck at this size on one core-pair. They do not include the reverse proxy (connection limits, timeouts, buffering), TLS, the network, mobile clients reconnecting, or many moderators working at the same time. Load-test the final server, proxy and network before promising capacity for 10,000 users.
+**Measured on a 2-vCPU sandbox** (server on one core; load generator — and the proxy replica when used — on the other; Node 22; local network). These are not production numbers.
 
-**What changed for efficiency:** messages are indexed per event and by id (no full scans on join, publish or reply); connections are grouped per event and role with an incremental count of connected attendees (the capacity check is no longer a scan of all connections); one heartbeat timer serves all connections instead of one timer per client; slow SSE clients are dropped once 1 MB is buffered; state writes are batched (at most one write per 150 ms–1 s instead of per 40 ms) and written asynchronously; attendee sessions are written separately and less often; expired sessions, tickets and rate-limit entries are cleaned up every minute; the moderator console coalesces bursts of realtime events into one reload and only reloads the block list when it changed, and no longer loses a reply that is being typed.
+|                                                                                              | v0.6.0                                                                                                                                           | v0.7.0                                                                                                                                                                                                                                    |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 5,000 attendees, each sends one message at once (direct, new connection per request)         | 158 × 201, 4,842 client time-outs (15 s); 64 published without success answer; event loop blocked 24.6 s; 4,245 accept-queue overflows           | 100 × 201, 4,900 × 429; all answered within 2.9 s; 0 without success answer; 0 duplicates; 500,000/500,000 deliveries; max event-loop delay 0.46 s; 0 overflows                                                                           |
+| 4,000 attendees, each sends one message at once, through an nginx replica of the proxy (TLS) | 1,242 × 201, 259 × 502, 2,499 × 504, all answered after 110 s; 77 without success answer; 46,057 overflows; proxy errors identical to production | only 201/429 (two runs: all answered after 6.1 s and 27.8 s — limited by the load generator and proxy sharing one core); 0 without success answer; 0 duplicates; all deliveries; max event-loop delay 0.2 s; 0 overflows; no proxy errors |
+| 5,000 attendees, 50 senders over 4.5 s (direct)                                              | 50 × 201, answer p50 135 ms, fan-out p95 150 ms                                                                                                  | 50 × 201, answer p50 85 ms, fan-out p95 255 ms                                                                                                                                                                                            |
+| 5,000 attendees join and connect (direct)                                                    | 6.3 s                                                                                                                                            | 4.2 s                                                                                                                                                                                                                                     |
+| 5,000 attendees join through the TLS replica                                                 | 25.3 s                                                                                                                                           | 22.2 s — dominated by TLS work of the generator (16 CPU-s) and proxy (10 CPU-s) on one shared core; the app used 10 CPU-s                                                                                                                 |
+
+Join time through the public route therefore depends mainly on TLS capacity of the proxy host and of whatever generates the load. Measure on the real hosts (`docs/load-testing.md`) before drawing conclusions.
+
+**Bandwidth.** Every published message is sent to every connected attendee. At 50 messages per second and 5,000 attendees that is 250,000 deliveries per second — about 51 MB/s (≈ 410 Mbit/s) of event data from the app to the proxy, and again (plus TLS) from the proxy to the attendees. Check the proxy host's network and the Internet uplink before raising `ROOM_PUBLISH_PER_SECOND` or the audience size.
+
+**Publishing 5,000 messages in 5 seconds to 5,000 readers** is a different goal from answering 5,000 senders quickly. It means 1,000 accepted messages per second and 5,000,000 deliveries per second: about 1 GB/s (≈ 8 Gbit/s) of event data before TLS, 206 kB/s per reader, and more text than anyone can read. One process on one host cannot do this; it needs (a) a product decision on what readers see (moderation, sampling, or showing a running count instead of every message), and (b) if every message must still reach every reader: several fan-out servers behind a load balancer with a shared message bus (for example Redis Streams or NATS), 10 GbE between them and the proxies, several TLS-terminating proxies, and an Internet uplink of that size — or a managed real-time service/CDN that does the fan-out. The journal, idempotent ids and bounded queues in v0.7.0 are the building blocks for that, but the multi-server part is not implemented.
 
 **Single instance.** The app is designed to run as **one** container:
 

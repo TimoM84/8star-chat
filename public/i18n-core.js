@@ -1034,6 +1034,37 @@
     ["messages", "berichten", "Nachrichten", "messages"],
     ["connected", "verbonden", "verbunden", "connectés"],
     ["participants", "deelnemers", "Teilnehmende", "participants"],
+    ["Sending…", "Versturen…", "Wird gesendet…", "Envoi…"],
+    [
+      "The connection was interrupted.",
+      "De verbinding is onderbroken.",
+      "Die Verbindung wurde unterbrochen.",
+      "La connexion a été interrompue.",
+    ],
+    [
+      "Your message could not be sent. Please try again.",
+      "Je bericht kon niet worden verstuurd. Probeer het opnieuw.",
+      "Deine Nachricht konnte nicht gesendet werden. Bitte versuche es erneut.",
+      "Votre message n’a pas pu être envoyé. Veuillez réessayer.",
+    ],
+    [
+      "Invalid message id.",
+      "Ongeldig bericht-ID.",
+      "Ungültige Nachrichten-ID.",
+      "Identifiant de message invalide.",
+    ],
+    [
+      "This message id was already used for another message.",
+      "Dit bericht-ID is al gebruikt voor een ander bericht.",
+      "Diese Nachrichten-ID wurde bereits für eine andere Nachricht verwendet.",
+      "Cet identifiant a déjà été utilisé pour un autre message.",
+    ],
+    [
+      "Your message could not be stored. Please try again.",
+      "Je bericht kon niet worden opgeslagen. Probeer het opnieuw.",
+      "Deine Nachricht konnte nicht gespeichert werden. Bitte versuche es erneut.",
+      "Votre message n’a pas pu être enregistré. Veuillez réessayer.",
+    ],
   ];
   const languages = ["en", "nl", "de", "fr"];
   const tables = languages.reduce((out, lang, i) => {

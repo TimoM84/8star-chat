@@ -1,14 +1,12 @@
 (() => {
   const { languages, createTranslator } = window.chatI18nCore;
-  const preferred =
-    (navigator.languages || [navigator.language || "en"])
-      .map((x) => String(x).slice(0, 2).toLowerCase())
-      .find((x) => ["nl", "de", "fr"].includes(x)) || "en";
+  // English is the default interface language; a language chosen with the
+  // picker is remembered in this browser.
   let current = "en";
   try {
-    current = localStorage.getItem("8star-language") || preferred;
+    current = localStorage.getItem("8star-language") || "en";
   } catch {
-    current = preferred;
+    current = "en";
   }
   if (!languages.includes(current)) current = "en";
   let translateCurrent = createTranslator(current);

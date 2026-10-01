@@ -4,6 +4,8 @@ const http = require("node:http"),
   path = require("node:path"),
   crypto = require("node:crypto"),
   net = require("node:net"),
+  zlib = require("node:zlib"),
+  { monitorEventLoopDelay, performance } = require("node:perf_hooks"),
   QRCode = require("qrcode");
 
 // ---------------------------------------------------------------------------
@@ -39,7 +41,20 @@ const MAX_MESSAGE = envNumber("MAX_MESSAGE_LENGTH", 500, 1),
   TICKET_MS = 30000,
   HEARTBEAT_MS = envNumber("HEARTBEAT_SECONDS", 20, 1) * 1000,
   SWEEP_MS = 60000,
-  SSE_MAX_BUFFER = 1024 * 1024,
+  SSE_MAX_BUFFER = envNumber("SSE_MAX_BUFFER_KB", 256, 16) * 1024,
+  // Live updates for attendees are sent in batches: at most one write per
+  // connection per FANOUT_INTERVAL_MS, spread over slices of FANOUT_SLICE
+  // connections so other requests are served in between.
+  FANOUT_INTERVAL_MS = envNumber("FANOUT_INTERVAL_MS", 100, 0),
+  FANOUT_SLICE = envNumber("FANOUT_SLICE", 500, 10),
+  // New messages are refused with 503 (instead of queueing) when the event loop
+  // has been stalled this long or too many messages wait for storage.
+  OVERLOAD_LAG_MS = envNumber("OVERLOAD_LAG_MS", 1000, 50),
+  MAX_PENDING_MESSAGES = envNumber("MAX_PENDING_MESSAGES", 1000, 1),
+  MAX_PENDING_EVENTS = envNumber("MAX_PENDING_EVENTS", 5000, 10),
+  LISTEN_BACKLOG = envNumber("LISTEN_BACKLOG", 4096, 128),
+  METRICS_LOG_SECONDS = envNumber("METRICS_LOG_SECONDS", 0, 0),
+  IDEMPOTENCY_MS = 24 * 3600000,
   MAX_GUEST_SESSIONS = envNumber("MAX_GUEST_SESSIONS", 200000, 1),
   LOGIN_MAX_FAILURES = 10,
   LOGIN_WINDOW_MS = 15 * 60000;
@@ -52,6 +67,66 @@ const MIME = {
 };
 const GUEST_COOKIE = "g8s",
   STAFF_COOKIE = "sid";
+
+// ---------------------------------------------------------------------------
+// Metrics (no message content, names, cookies or tokens are recorded)
+// ---------------------------------------------------------------------------
+class Stat {
+  constructor() {
+    this.reset();
+  }
+  reset() {
+    this.n = 0;
+    this.max = 0;
+    this.samples = [];
+  }
+  add(v) {
+    this.n++;
+    if (v > this.max) this.max = v;
+    // Reservoir sample keeps memory bounded.
+    if (this.samples.length < 1000) this.samples.push(v);
+    else {
+      const i = Math.floor(Math.random() * this.n);
+      if (i < 1000) this.samples[i] = v;
+    }
+  }
+  summary() {
+    if (!this.n) return { n: 0 };
+    const s = [...this.samples].sort((a, b) => a - b),
+      at = (p) => +s[Math.min(s.length - 1, Math.floor(p * s.length))].toFixed(1);
+    return { n: this.n, p50: at(0.5), p95: at(0.95), max: +this.max.toFixed(1) };
+  }
+}
+const loopDelay = monitorEventLoopDelay({ resolution: 10 });
+loopDelay.enable();
+const metrics = {
+  counters: {},
+  inc(name, n = 1) {
+    this.counters[name] = (this.counters[name] || 0) + n;
+  },
+  post: { admission: new Stat(), commit: new Stat(), total: new Stat() },
+  join: new Stat(),
+  fanout: { flush: new Stat(), events: 0, writes: 0, slowDrops: 0, maxQueued: 0, maxBufferedKB: 0 },
+  journal: {
+    write: new Stat(),
+    size: new Stat(),
+    errors: 0,
+    add(ms, n) {
+      this.write.add(ms);
+      this.size.add(n);
+    },
+  },
+  snapshots: 0,
+};
+// Detects a stalled event loop while it is still busy: a request handled long
+// after the last timer tick means the server is behind.
+let lastTickAt = performance.now();
+setInterval(() => (lastTickAt = performance.now()), 50).unref();
+const currentLagMs = () => Math.max(0, performance.now() - lastTickAt - 50);
+
+const id = () => crypto.randomBytes(12).toString("hex");
+const randomToken = () => crypto.randomBytes(32).toString("base64url");
+const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
 
 // ---------------------------------------------------------------------------
 // Persistent data
@@ -78,7 +153,9 @@ if (state.ipBlockKey) delete state.ipBlockKey;
 
 // Debounced, non-overlapping JSON writer. Batches bursts of changes into one
 // write instead of serialising the full state on every mutation.
-function createStore(file, getData, delay, maxDelay, mode) {
+// hooks.before() runs before the data is serialised and may wait (async);
+// whatever it returns is passed to hooks.after() once the file is in place.
+function createStore(file, getData, delay, maxDelay, mode, hooks = {}) {
   let timer = null,
     firstDirtyAt = 0,
     writing = false,
@@ -95,10 +172,18 @@ function createStore(file, getData, delay, maxDelay, mode) {
     dirty = false;
     const tmp = file + ".tmp";
     try {
-      await fs.promises.writeFile(tmp, JSON.stringify(getData()), mode ? { mode } : undefined);
+      const token = hooks.before ? await hooks.before() : undefined;
+      if (closed) return;
+      // Serialisation is synchronous: nothing can change between before() and here.
+      const text = JSON.stringify(getData());
+      metrics.snapshots++;
+      await fs.promises.writeFile(tmp, text, mode ? { mode } : undefined);
       // A synchronous shutdown flush may have written newer data meanwhile.
       if (closed) await fs.promises.rm(tmp, { force: true });
-      else await fs.promises.rename(tmp, file);
+      else {
+        await fs.promises.rename(tmp, file);
+        if (hooks.after) await hooks.after(token);
+      }
     } catch (err) {
       console.error("Could not save " + path.basename(file) + ":", err.message);
       dirty = true;
@@ -108,24 +193,141 @@ function createStore(file, getData, delay, maxDelay, mode) {
     }
   };
   function schedule() {
+    if (closed) return;
     const now = Date.now();
     if (!firstDirtyAt) firstDirtyAt = now;
     if (timer) clearTimeout(timer);
     timer = setTimeout(writeNow, Math.max(0, Math.min(delay, firstDirtyAt + maxDelay - now)));
   }
   const flushSync = () => {
-    if (closed || (!timer && !dirty && !writing)) return;
+    if (closed) return;
     closed = true;
     if (timer) clearTimeout(timer);
     timer = null;
+    const token = hooks.beforeSync ? hooks.beforeSync() : undefined;
     const tmp = file + ".sync.tmp";
     fs.writeFileSync(tmp, JSON.stringify(getData()), mode ? { mode } : undefined);
     fs.renameSync(tmp, file);
+    if (hooks.afterSync) hooks.afterSync(token);
     dirty = false;
   };
   return { schedule, flushSync };
 }
-const stateStore = createStore(DATA_FILE, () => state, 150, 1000, 0o600);
+
+// ---------------------------------------------------------------------------
+// Message journal (group commit)
+// ---------------------------------------------------------------------------
+// Attendee messages are appended to a journal file before they are confirmed
+// (HTTP 201) or shown to anyone. All messages that arrive while one write is
+// in progress are written together in the next write ("group commit"), so a
+// burst costs a handful of disk writes instead of one per message.
+// The full state snapshot (state.json) is still written in the background; each
+// snapshot rotates the journal, and journal files that the snapshot covers are
+// removed afterwards. On start-up, journal files are replayed into the state.
+const JOURNAL_FSYNC = String(process.env.JOURNAL_FSYNC || "true").toLowerCase() !== "false";
+const journal = (() => {
+  const prefix = "messages-",
+    suffix = ".journal";
+  const files = () =>
+    fs
+      .readdirSync(DATA_DIR)
+      .filter((f) => f.startsWith(prefix) && f.endsWith(suffix))
+      .map((f) => ({ f, n: Number(f.slice(prefix.length, -suffix.length)) }))
+      .filter((x) => Number.isInteger(x.n))
+      .sort((a, b) => a.n - b.n);
+  let current = (files().at(-1)?.n || 0) + 1,
+    handle = null,
+    handleN = 0,
+    queue = [],
+    writing = null; // promise of the write in progress
+  const fileName = (n) => path.join(DATA_DIR, prefix + n + suffix);
+  async function writeBatch() {
+    const batch = queue;
+    queue = [];
+    const t0 = performance.now();
+    try {
+      if (!handle || handleN !== current) {
+        if (handle) await handle.close().catch(() => {});
+        handleN = current;
+        handle = await fs.promises.open(fileName(current), "a", 0o600);
+      }
+      await handle.write(batch.map((x) => JSON.stringify(x.m) + "\n").join(""));
+      if (JOURNAL_FSYNC) await handle.datasync();
+      metrics.journal.add(performance.now() - t0, batch.length);
+      for (const x of batch) x.resolve();
+    } catch (err) {
+      console.error("Could not write message journal:", err.message);
+      metrics.journal.errors++;
+      for (const x of batch) x.reject(err);
+      if (handle) await handle.close().catch(() => {});
+      handle = null;
+    }
+  }
+  function pump() {
+    if (writing || !queue.length) return;
+    writing = writeBatch().finally(() => {
+      writing = null;
+      pump();
+    });
+  }
+  return {
+    get pending() {
+      return queue.length + (writing ? 1 : 0);
+    },
+    append(m) {
+      return new Promise((resolve, reject) => {
+        queue.push({ m, resolve, reject });
+        if (!writing) setImmediate(pump); // collect everything from this loop turn
+      });
+    },
+    // Wait until no write is in progress or queued.
+    async idle() {
+      while (writing || queue.length) {
+        pump();
+        await writing;
+      }
+    },
+    // Start a new journal file; return the files that the next snapshot covers.
+    rotate() {
+      const covered = files().map((x) => x.f);
+      current++;
+      return covered;
+    },
+    remove(list) {
+      for (const f of list || []) fs.rmSync(path.join(DATA_DIR, f), { force: true });
+    },
+    // Messages from journal files that are not in the snapshot yet.
+    replay(known) {
+      const out = [];
+      for (const { f } of files())
+        for (const line of fs.readFileSync(path.join(DATA_DIR, f), "utf8").split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            const m = JSON.parse(line);
+            if (m?.id && !known.has(m.id)) {
+              known.add(m.id);
+              out.push(m);
+            }
+          } catch {
+            // A torn last line from a crash: the message was never confirmed.
+          }
+        }
+      return out;
+    },
+    closeSync() {
+      if (handle) handle.close().catch(() => {});
+    },
+  };
+})();
+const stateStore = createStore(DATA_FILE, () => state, 500, 2000, 0o600, {
+  before: async () => {
+    await journal.idle();
+    return journal.rotate();
+  },
+  after: (covered) => journal.remove(covered),
+  // On shutdown the journal is kept: a write may still be completing. Replay
+  // at the next start skips messages that are already in the snapshot.
+});
 const save = () => stateStore.schedule();
 
 let migrated = Boolean(legacyIpBlockKey);
@@ -158,7 +360,27 @@ const indexMessage = (m) => {
   messagesBySlug.get(m.slug).push(m);
   messagesById.set(m.id, m);
 };
+{
+  // Replay confirmed messages that were journaled after the last snapshot.
+  const replayed = journal.replay(new Set(state.messages.map((m) => m.id)));
+  if (replayed.length) {
+    state.messages.push(...replayed);
+    console.log("Recovered " + replayed.length + " message(s) from the journal.");
+    save();
+  }
+}
 state.messages.forEach(indexMessage);
+// clientMessageId -> message, per attendee session (key = sha256(session:id)).
+const CLIENT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const idempotency = new Map();
+for (const m of state.messages)
+  if (m.clientKey)
+    idempotency.set(m.clientKey, {
+      messageId: m.id,
+      textHash: sha256((m.type === "private" ? "private" : "public") + ":" + m.text),
+      at: Date.parse(m.createdAt) || Date.now(),
+      pending: null,
+    });
 const eventMessages = (slug) => messagesBySlug.get(slug) || [];
 const findMessage = (messageId, slug) => {
   const m = messagesById.get(String(messageId || ""));
@@ -173,9 +395,6 @@ function addMessage(m) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-const id = () => crypto.randomBytes(12).toString("hex");
-const randomToken = () => crypto.randomBytes(32).toString("base64url");
-const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
 const secretEqual = (a, b) => {
   const x = Buffer.from(String(a || "")),
     y = Buffer.from(String(b || ""));
@@ -516,11 +735,17 @@ let connectionCount = 0;
 const room = (slug) => {
   if (!rooms.has(slug))
     rooms.set(slug, {
+      slug,
       guest: new Set(),
       moderator: new Set(),
       stage: new Set(),
       private: new Set(),
       participants: new Map(),
+      // Batched delivery to attendees (see deliverToGuests).
+      outbox: [],
+      job: null,
+      timer: null,
+      lastFlush: 0,
     });
   return rooms.get(slug);
 };
@@ -528,8 +753,10 @@ const countConnections = (slug) => rooms.get(slug)?.participants.size || 0;
 function sseWrite(c, payload) {
   const res = c.res;
   if (res.destroyed || res.writableEnded) return false;
-  // Drop clients that stop reading instead of buffering without limit.
+  // Drop clients that stop reading instead of buffering without limit. The
+  // browser reconnects and receives the recent history again.
   if (res.writableLength > SSE_MAX_BUFFER) {
+    metrics.fanout.slowDrops++;
     res.destroy();
     return false;
   }
@@ -558,12 +785,72 @@ function removeConnection(slug, c) {
     else r.participants.delete(c.participantId);
   }
 }
+
+// Writing to a socket costs about the same for one event as for ten (the
+// system call dominates, measured ~12–19 µs per connection). Attendee events
+// are therefore queued per event and written as one batch per connection:
+//  - the first event after a quiet period goes out on the next loop turn;
+//  - further events within FANOUT_INTERVAL_MS are collected into the next batch;
+//  - a batch is written in slices of FANOUT_SLICE connections with the event
+//    loop free in between, so new requests keep being answered;
+//  - batches are written strictly one after another, so every connection
+//    receives events in the order they were queued.
+// The queue is bounded: queueing fails (and the caller answers 503) when
+// MAX_PENDING_EVENTS events are waiting.
+function deliverToGuests(r, payload) {
+  if (r.outbox.length >= MAX_PENDING_EVENTS) return false;
+  r.outbox.push(payload);
+  if (r.outbox.length > metrics.fanout.maxQueued) metrics.fanout.maxQueued = r.outbox.length;
+  scheduleFlush(r);
+  return true;
+}
+const guestBacklog = (r) => (r ? r.outbox.length : 0);
+function scheduleFlush(r) {
+  if (r.timer || r.job || !r.outbox.length) return;
+  const wait = Math.max(0, r.lastFlush + FANOUT_INTERVAL_MS - Date.now());
+  r.timer = wait ? setTimeout(startFlush, wait, r) : setImmediate(startFlush, r);
+}
+function startFlush(r) {
+  r.timer = null;
+  if (!r.outbox.length) return;
+  const events = r.outbox.length,
+    buffer = Buffer.from(r.outbox.join(""));
+  r.outbox = [];
+  r.lastFlush = Date.now();
+  r.job = { buffer, conns: [...r.guest], i: 0, t0: performance.now(), events };
+  writeSlice(r);
+}
+function writeSlice(r) {
+  const job = r.job,
+    end = Math.min(job.conns.length, job.i + FANOUT_SLICE);
+  for (; job.i < end; job.i++) sseWrite(job.conns[job.i], job.buffer);
+  if (job.i < job.conns.length) return setImmediate(writeSlice, r);
+  // Writes are flushed to the sockets on the next tick; measure after that.
+  setImmediate(() => {
+    let buffered = 0;
+    for (const c of job.conns) buffered += c.res.writableLength || 0;
+    metrics.fanout.flush.add(performance.now() - job.t0);
+    metrics.fanout.events += job.events;
+    metrics.fanout.writes += job.conns.length;
+    metrics.fanout.maxBufferedKB = Math.max(metrics.fanout.maxBufferedKB, Math.round(buffered / 1024));
+    r.job = null;
+    scheduleFlush(r);
+  });
+}
 const AUDIENCES = { all: ["guest", "moderator", "stage"], moderator: ["moderator"], stage: ["stage"] };
+// Returns false only when the attendee queue is full (the event was not sent
+// to attendees). Staff screens are few and are written to directly.
 function broadcast(slug, kind, data, audience = "all") {
   const r = rooms.get(slug);
-  if (!r) return;
+  if (!r) return true;
   const p = ssePayload(kind, data);
-  for (const role of AUDIENCES[audience] || []) for (const c of r[role]) sseWrite(c, p);
+  let queued = true;
+  for (const role of AUDIENCES[audience] || []) {
+    if (role === "guest") {
+      if (r.guest.size) queued = deliverToGuests(r, p);
+    } else for (const c of r[role]) sseWrite(c, p);
+  }
+  return queued;
 }
 function sendPrivate(slug, participantId, kind, data) {
   const r = rooms.get(slug);
@@ -592,11 +879,23 @@ function revokeUserAccess(userId) {
   for (const [sid, session] of sessions) if (session.userId === userId) sessions.delete(sid);
   revokeUserStreams(userId);
 }
-// One heartbeat timer for all connections instead of one timer per client.
+// One heartbeat for all connections, written in slices like the batches.
+const PING = Buffer.from(": ping\n\n");
+let heartbeatRunning = false;
 const heartbeat = setInterval(() => {
+  if (heartbeatRunning) return;
+  heartbeatRunning = true;
+  const all = [];
   for (const r of rooms.values())
-    for (const role of ["guest", "moderator", "stage", "private"])
-      for (const c of r[role]) sseWrite(c, ": ping\n\n");
+    for (const role of ["guest", "moderator", "stage", "private"]) for (const c of r[role]) all.push(c);
+  let i = 0;
+  const step = () => {
+    const end = Math.min(all.length, i + FANOUT_SLICE);
+    for (; i < end; i++) sseWrite(all[i], PING);
+    if (i < all.length) setImmediate(step);
+    else heartbeatRunning = false;
+  };
+  step();
 }, HEARTBEAT_MS);
 heartbeat.unref();
 
@@ -606,6 +905,14 @@ heartbeat.unref();
 const eventBySlug = (s) => state.events.find((e) => e.slug === s);
 // Messages as shown to attendees and on public channels. Staff e-mail
 // addresses are never exposed there.
+// What attendees receive for a public message: only what the chat shows.
+// Every byte is sent to every connected attendee, so this stays small.
+const publicView = (m) => ({
+  id: m.id,
+  author: m.type === "announcement" ? "Moderator" : m.author,
+  text: m.text,
+  createdAt: m.createdAt,
+});
 const messageEvent = (m) => ({
   id: m.id,
   slug: m.slug,
@@ -646,7 +953,17 @@ const recent = (slug, n = 60) => {
     out = [];
   for (let i = rows.length - 1; i >= 0 && out.length < n; i--) {
     const m = rows[i];
-    if (m.visibility === "public" && m.status === "published") out.push(messageEvent(m));
+    if (m.visibility === "public" && m.status === "published") out.push(publicView(m));
+  }
+  return out.reverse();
+};
+// Public messages published at or after position `from` in the event's list.
+const recentSince = (slug, from, n = 60) => {
+  const rows = eventMessages(slug),
+    out = [];
+  for (let i = rows.length - 1; i >= from && out.length < n; i--) {
+    const m = rows[i];
+    if (m.visibility === "public" && m.status === "published") out.push(publicView(m));
   }
   return out.reverse();
 };
@@ -739,6 +1056,8 @@ function sweep() {
       closeStreams(u.slug, (c) => c.unlockToken === token, "private-locked");
     }
   for (const [ticket, t] of streamTickets) if (t.expiresAt < now) streamTickets.delete(ticket);
+  for (const [key, entry] of idempotency)
+    if (!entry.pending && now - entry.at > IDEMPOTENCY_MS) idempotency.delete(key);
   for (const [key, t] of userRate) if (now - t > 10000) userRate.delete(key);
   for (const [slug, times] of roomRate) if (!times.some((t) => now - t < 1000)) roomRate.delete(slug);
   for (const [key, f] of loginFailures) if (now - f.first > LOGIN_WINDOW_MS) loginFailures.delete(key);
@@ -751,7 +1070,22 @@ setInterval(sweep, Math.min(SWEEP_MS, PRIVATE_IDLE_MS)).unref();
 // ---------------------------------------------------------------------------
 // HTTP handler
 // ---------------------------------------------------------------------------
+// Static files are read and compressed once at start-up.
+const staticAssets = new Map();
+for (const name of fs.readdirSync(PUBLIC_DIR)) {
+  const file = path.join(PUBLIC_DIR, name);
+  if (!fs.statSync(file).isFile()) continue;
+  const raw = fs.readFileSync(file);
+  staticAssets.set(file, {
+    raw,
+    gzip: zlib.gzipSync(raw, { level: 9 }),
+    br: zlib.brotliCompressSync(raw, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11 } }),
+    type: MIME[path.extname(file)] || "application/octet-stream",
+    etag: '"' + crypto.createHash("sha256").update(raw).digest("base64url").slice(0, 22) + '"',
+  });
+}
 const server = http.createServer(async (req, res) => {
+  const reqStart = performance.now();
   const url = new URL(req.url, "http://localhost");
   res.setHeader("x-content-type-options", "nosniff");
   res.setHeader("referrer-policy", "same-origin");
@@ -883,6 +1217,13 @@ const server = http.createServer(async (req, res) => {
         // following visitor never inherits it.
         const previous = cookie(req, GUEST_COOKIE) || String(req.headers["x-guest-session"] || "");
         if (previous) endGuestSession(sha256(previous));
+        // A client may ask for a shorter session (load tests do, so abandoned
+        // test sessions expire quickly); never longer than GUEST_SESSION_HOURS.
+        const minutes = Number(b.sessionMinutes),
+          lifetime =
+            Number.isFinite(minutes) && minutes >= 1
+              ? Math.min(GUEST_SESSION_MS, minutes * 60000)
+              : GUEST_SESSION_MS;
         const raw = randomToken(),
           now = Date.now(),
           rec = {
@@ -893,7 +1234,7 @@ const server = http.createServer(async (req, res) => {
             language: sanitize(b.language, 40),
             ipHash: visitorIpHash,
             createdAt: now,
-            expiresAt: now + GUEST_SESSION_MS,
+            expiresAt: now + lifetime,
             pin: null,
             pinFailures: 0,
             pinConsecutive: 0,
@@ -901,17 +1242,31 @@ const server = http.createServer(async (req, res) => {
           };
         guestSessions.set(rec.key, rec);
         saveGuests();
+        // The first stream ticket comes with the join, saving one round trip
+        // through the proxy. The join already carries the history, so the
+        // stream only sends what was published after this moment.
+        const ticket = randomToken();
+        streamTickets.set(ticket, {
+          key: rec.key,
+          slug,
+          scope: "public",
+          unlockToken: "",
+          expiresAt: now + TICKET_MS,
+          historyFrom: eventMessages(slug).length,
+        });
+        metrics.join.add(performance.now() - reqStart);
         return send(
           res,
           200,
           {
             ...guestView(rec, e),
+            ticket,
             history: recent(slug),
             // Only returned when the client reports that cookies are blocked
             // (e.g. third-party iframe in Safari); kept in tab memory/sessionStorage.
             ...(b.cookieless === true ? { sessionToken: raw } : {}),
           },
-          { "set-cookie": guestCookie(req, slug, raw, Math.floor(GUEST_SESSION_MS / 1000)) },
+          { "set-cookie": guestCookie(req, slug, raw, Math.floor(lifetime / 1000)) },
         );
       }
       if (action === "session" && req.method === "GET") {
@@ -919,7 +1274,10 @@ const server = http.createServer(async (req, res) => {
         if (!rec) return send(res, 401, { error: "Session expired." });
         if (participantIsBanned(slug, rec.participantId) || ipIsBanned(slug, rec.ipHash))
           return send(res, 403, { error: "You do not have access to this chat." });
-        return send(res, 200, { ...guestView(rec, e), history: recent(slug) });
+        return send(res, 200, {
+          ...guestView(rec, e),
+          ...(url.searchParams.get("light") ? {} : { history: recent(slug) }),
+        });
       }
       if (action === "session/end" && req.method === "POST") {
         const rec = guestFromRequest(req, slug);
@@ -1086,7 +1444,12 @@ const server = http.createServer(async (req, res) => {
             : {
                 connections: countConnections(slug),
                 capacity: e.capacity,
-                history: role === "stage" ? stageQueue(slug) : recent(slug),
+                history:
+                  role === "stage"
+                    ? stageQueue(slug)
+                    : ticket?.historyFrom !== undefined
+                      ? recentSince(slug, ticket.historyFrom)
+                      : recent(slug),
                 pins: pinnedForEvent(e),
                 stage: role === "stage" ? stageSnapshot(e) : undefined,
               };
@@ -1096,6 +1459,15 @@ const server = http.createServer(async (req, res) => {
       }
 
       // ---- Attendee messages -------------------------------------------------
+      // POST /messages
+      //   201  new message: stored in the journal (written, fdatasync'd), added
+      //        to the chat and queued for live delivery in order.
+      //   200  same clientMessageId sent again: the original result, no copy.
+      //   429  refused by a rate limit (Retry-After); nothing was stored.
+      //   503  refused because the server is overloaded or could not store the
+      //        message (Retry-After); nothing was stored.
+      // A client that gets no answer (time-out, 502) can ask
+      // GET /messages/status?clientMessageId=… or simply retry with the same id.
       if (action === "messages" && req.method === "POST") {
         const g = guestFromRequest(req, slug);
         if (!g) return send(res, 401, { error: "Session expired." });
@@ -1122,13 +1494,71 @@ const server = http.createServer(async (req, res) => {
         if (!text) return send(res, 400, { error: "Please enter a message first." });
         if (blockedTerm(text, e.blockedWords))
           return send(res, 400, { error: "Your message contains a blocked word or phrase." });
+        // Idempotency: the same clientMessageId from the same session never
+        // creates a second message.
+        const clientMessageId = b.clientMessageId === undefined ? "" : String(b.clientMessageId);
+        if (clientMessageId && !CLIENT_ID_RE.test(clientMessageId))
+          return send(res, 400, { error: "Invalid message id." });
+        const idemKey = clientMessageId ? sha256(g.key + ":" + clientMessageId) : "",
+          textHash = sha256(kind + ":" + text);
+        if (idemKey && idempotency.has(idemKey)) {
+          const entry = idempotency.get(idemKey);
+          if (entry.textHash !== textHash)
+            return send(res, 409, { error: "This message id was already used for another message." });
+          if (entry.pending) await entry.pending.catch(() => {});
+          const original = idempotency.has(idemKey) ? messagesById.get(entry.messageId) : null;
+          if (original) {
+            metrics.inc("post.replayed");
+            return send(res, 200, {
+              ok: true,
+              replayed: true,
+              status: original.status,
+              message: original.type === "private" ? privateView(original) : messageEvent(original),
+            });
+          }
+          // The earlier attempt was not stored; continue as a new attempt.
+        }
         const now = Date.now(),
           last = userRate.get(g.key) || 0;
-        if (now - last < 5000)
-          return send(res, 429, { error: "Please wait before sending another message." });
+        if (now - last < 5000) {
+          metrics.inc("post.429.user");
+          return send(
+            res,
+            429,
+            {
+              error: "Please wait before sending another message.",
+              retryAfter: Math.ceil((last + 5000 - now) / 1000),
+            },
+            { "retry-after": String(Math.ceil((last + 5000 - now) / 1000)) },
+          );
+        }
         const direct = e.mode === "open" && kind === "public";
-        if (direct && !roomRateAllowed(slug))
-          return send(res, 429, { error: "This chat is busy. Please try again shortly." });
+        // Overload protection: refuse quickly instead of queueing work that
+        // would only be answered after the client has given up.
+        const r = rooms.get(slug);
+        if (
+          shuttingDown ||
+          currentLagMs() > OVERLOAD_LAG_MS ||
+          journal.pending >= MAX_PENDING_MESSAGES ||
+          (direct && guestBacklog(r) >= MAX_PENDING_EVENTS - 10)
+        ) {
+          metrics.inc("post.503.overload");
+          return send(
+            res,
+            503,
+            { error: "This chat is busy. Please try again shortly.", retryAfter: 2 },
+            { "retry-after": "2" },
+          );
+        }
+        if (direct && !roomRateAllowed(slug)) {
+          metrics.inc("post.429.room");
+          return send(
+            res,
+            429,
+            { error: "This chat is busy. Please try again shortly.", retryAfter: 1 },
+            { "retry-after": "1" },
+          );
+        }
         userRate.set(g.key, now);
         const m = {
           id: id(),
@@ -1141,14 +1571,37 @@ const server = http.createServer(async (req, res) => {
           visibility: direct ? "public" : "private",
           status: direct ? "published" : kind === "private" ? "private" : "pending",
           language: g.language || "",
-          createdAt: new Date().toISOString(),
+          createdAt: new Date(now).toISOString(),
+          ...(idemKey ? { clientKey: idemKey } : {}),
         };
         if (direct) m.publishedAt = m.createdAt;
-        addMessage(m);
+        const tAdmitted = performance.now();
+        metrics.post.admission.add(tAdmitted - reqStart);
+        const entry = { messageId: m.id, textHash, at: now, pending: journal.append(m) };
+        if (idemKey) idempotency.set(idemKey, entry);
+        try {
+          await entry.pending;
+        } catch {
+          if (idemKey) idempotency.delete(idemKey);
+          if (userRate.get(g.key) === now) userRate.delete(g.key);
+          metrics.inc("post.503.storage");
+          return send(
+            res,
+            503,
+            { error: "Your message could not be stored. Please try again.", retryAfter: 2 },
+            { "retry-after": "2" },
+          );
+        }
+        entry.pending = null;
+        metrics.post.commit.add(performance.now() - tAdmitted);
+        // Stored: make it part of the chat and queue live delivery.
+        state.messages.push(m);
+        indexMessage(m);
+        save();
+        metrics.inc("post.201");
         if (kind === "private") {
           e.privateThreads ||= {};
           e.privateThreads[m.participantId] = { status: "open", updatedAt: m.createdAt };
-          save();
           broadcast(
             slug,
             "private-thread-status",
@@ -1157,13 +1610,37 @@ const server = http.createServer(async (req, res) => {
           );
           broadcast(slug, "private-message", messageEvent(m), "moderator");
           sendPrivate(slug, m.participantId, "private", privateView(m));
+          metrics.post.total.add(performance.now() - reqStart);
           return send(res, 201, { ok: true, status: m.status, message: privateView(m) });
         }
         if (direct) {
-          broadcast(slug, "public", messageEvent(m));
+          broadcast(slug, "public", publicView(m));
           broadcast(slug, "public-message", messageEvent(m), "moderator");
         } else broadcast(slug, "inbox", messageEvent(m), "moderator");
+        metrics.post.total.add(performance.now() - reqStart);
         return send(res, 201, { ok: true, status: m.status, message: messageEvent(m) });
+      }
+      // Outcome of a message sent with a clientMessageId, for this session only.
+      // Returns no message text.
+      if (action === "messages/status" && req.method === "GET") {
+        const g = guestFromRequest(req, slug);
+        if (!g) return send(res, 401, { error: "Session expired." });
+        const clientMessageId = url.searchParams.get("clientMessageId") || "";
+        if (!CLIENT_ID_RE.test(clientMessageId)) return send(res, 400, { error: "Invalid message id." });
+        const entry = idempotency.get(sha256(g.key + ":" + clientMessageId));
+        if (!entry) return send(res, 404, { status: "unknown" });
+        if (entry.pending) return send(res, 202, { status: "pending" });
+        const m = messagesById.get(entry.messageId);
+        if (!m) return send(res, 404, { status: "unknown" });
+        return send(res, 200, {
+          status: "accepted",
+          message: {
+            id: m.id,
+            kind: m.type === "private" ? "private" : "public",
+            status: m.status,
+            createdAt: m.createdAt,
+          },
+        });
       }
 
       // ---- Staff endpoints -----------------------------------------------------
@@ -1175,7 +1652,7 @@ const server = http.createServer(async (req, res) => {
             (m) => mod.role === "owner" || canManageEvent(mod, e) || !m.assignedTo || m.assignedTo === mod.id,
           )
           .map((m) => {
-            const { ipHash, ...visible } = m;
+            const { ipHash, clientKey, ...visible } = m;
             return { ...visible, ipAvailable: Boolean(ipHash) && TRUST_PROXY };
           });
         return send(res, 200, {
@@ -1254,7 +1731,7 @@ const server = http.createServer(async (req, res) => {
         m.assignedAt = assignedTo ? new Date().toISOString() : "";
         save();
         broadcast(slug, "assignment", assignmentEvent(m), "moderator");
-        const { ipHash, ...visible } = m;
+        const { ipHash, clientKey, ...visible } = m;
         return send(res, 200, { message: visible });
       }
       if (action.startsWith("conversations/") && req.method === "POST") {
@@ -1331,7 +1808,7 @@ const server = http.createServer(async (req, res) => {
         addMessage(m);
         e.pinnedMessages.push({ messageId: m.id, color: color(b.color, "#111111"), by: mod.email, at: now });
         save();
-        broadcast(slug, "public", messageEvent(m));
+        broadcast(slug, "public", publicView(m));
         broadcast(slug, "public-message", messageEvent(m), "moderator");
         const pins = pinnedForEvent(e);
         broadcast(slug, "pins", pins);
@@ -1435,7 +1912,7 @@ const server = http.createServer(async (req, res) => {
           m.status = "published";
           m.visibility = "public";
           m.publishedAt = new Date().toISOString();
-          broadcast(slug, "public", messageEvent(m));
+          broadcast(slug, "public", publicView(m));
         }
         if (act === "withdraw") {
           if (m.status !== "published" && m.status !== "withdrawn")
@@ -1864,14 +2341,31 @@ const server = http.createServer(async (req, res) => {
         url.pathname === "/" || spa ? "index.html" : decodeURIComponent(url.pathname).replace(/^\/+/, ""),
       );
     if (!file.startsWith(PUBLIC_DIR + path.sep)) return send(res, 403, { error: "Forbidden" });
-    fs.readFile(file, (err, data) => {
-      if (err) return send(res, 404, { error: "Not found" });
-      res.writeHead(200, {
-        "content-type": MIME[path.extname(file)] || "application/octet-stream",
-        "cache-control": "no-cache",
-      });
-      res.end(data);
+    const asset = staticAssets.get(file);
+    if (!asset) return send(res, 404, { error: "Not found" });
+    // Browsers revalidate (no-cache) and get 304 when nothing changed.
+    const headers = {
+      "content-type": asset.type,
+      "cache-control": "no-cache",
+      etag: asset.etag,
+      vary: "Accept-Encoding",
+    };
+    if (String(req.headers["if-none-match"] || "") === asset.etag) {
+      res.writeHead(304, headers);
+      return res.end();
+    }
+    const accept = String(req.headers["accept-encoding"] || "");
+    const [encoding, data] = /\bbr\b/.test(accept)
+      ? ["br", asset.br]
+      : /\bgzip\b/.test(accept)
+        ? ["gzip", asset.gzip]
+        : ["", asset.raw];
+    res.writeHead(200, {
+      ...headers,
+      ...(encoding ? { "content-encoding": encoding } : {}),
+      "content-length": data.length,
     });
+    res.end(req.method === "HEAD" ? undefined : data);
   } catch (err) {
     if (!(err instanceof SyntaxError) && err.message !== "Request too large") console.error(err);
     if (!res.headersSent)
@@ -1884,7 +2378,89 @@ const server = http.createServer(async (req, res) => {
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
 server.requestTimeout = 0; // SSE connections are long-lived.
-server.listen(PORT, "0.0.0.0", () => console.log("8star Chat listening on " + PORT));
+server.listen({ port: PORT, host: "0.0.0.0", backlog: LISTEN_BACKLOG }, () =>
+  console.log("8star Chat listening on " + PORT),
+);
+
+// Periodic metrics line in the container log (METRICS_LOG_SECONDS > 0).
+// Contains counts and timings only.
+if (METRICS_LOG_SECONDS > 0) {
+  let lastCpu = process.cpuUsage(),
+    lastElu = performance.eventLoopUtilization(),
+    lastAt = performance.now();
+  setInterval(() => {
+    const now = performance.now(),
+      cpu = process.cpuUsage(lastCpu),
+      elu = performance.eventLoopUtilization(lastElu),
+      mem = process.memoryUsage();
+    let guests = 0,
+      staff = 0,
+      privateStreams = 0,
+      queued = 0;
+    for (const r of rooms.values()) {
+      guests += r.guest.size;
+      staff += r.moderator.size + r.stage.size;
+      privateStreams += r.private.size;
+      queued += r.outbox.length;
+    }
+    const line = {
+      metrics: {
+        at: new Date().toISOString(),
+        seconds: +((now - lastAt) / 1000).toFixed(1),
+        loopDelayMs: {
+          p50: +(loopDelay.percentile(50) / 1e6).toFixed(1),
+          p99: +(loopDelay.percentile(99) / 1e6).toFixed(1),
+          max: +(loopDelay.max / 1e6).toFixed(1),
+        },
+        loopUtilization: +elu.utilization.toFixed(3),
+        cpuPercent: Math.round(((cpu.user + cpu.system) / 1000 / (now - lastAt)) * 100),
+        rssMB: Math.round(mem.rss / 1048576),
+        heapMB: Math.round(mem.heapUsed / 1048576),
+        connections: { guests, privateStreams, staff, total: connectionCount },
+        attendeeSessions: guestSessions.size,
+        counters: metrics.counters,
+        postMs: {
+          admission: metrics.post.admission.summary(),
+          storage: metrics.post.commit.summary(),
+          total: metrics.post.total.summary(),
+        },
+        joinMs: metrics.join.summary(),
+        fanout: {
+          batchMs: metrics.fanout.flush.summary(),
+          events: metrics.fanout.events,
+          writes: metrics.fanout.writes,
+          queuedNow: queued,
+          maxQueued: metrics.fanout.maxQueued,
+          maxBufferedKB: metrics.fanout.maxBufferedKB,
+          slowClientsDropped: metrics.fanout.slowDrops,
+        },
+        journal: {
+          writeMs: metrics.journal.write.summary(),
+          messagesPerWrite: metrics.journal.size.summary(),
+          errors: metrics.journal.errors,
+          pendingNow: journal.pending,
+        },
+        snapshots: metrics.snapshots,
+      },
+    };
+    console.log(JSON.stringify(line));
+    loopDelay.reset();
+    metrics.counters = {};
+    metrics.post.admission.reset();
+    metrics.post.commit.reset();
+    metrics.post.total.reset();
+    metrics.join.reset();
+    metrics.fanout.flush.reset();
+    Object.assign(metrics.fanout, { events: 0, writes: 0, slowDrops: 0, maxQueued: 0, maxBufferedKB: 0 });
+    metrics.journal.write.reset();
+    metrics.journal.size.reset();
+    metrics.journal.errors = 0;
+    metrics.snapshots = 0;
+    lastCpu = process.cpuUsage();
+    lastElu = performance.eventLoopUtilization();
+    lastAt = now;
+  }, METRICS_LOG_SECONDS * 1000).unref();
+}
 
 // Write pending data before the container stops.
 let shuttingDown = false;
@@ -1899,7 +2475,9 @@ function shutdown(signal) {
     console.error("Could not save data during shutdown:", err.message);
   }
   closeStreams("", () => true, "server-restart");
-  server.close(() => process.exit(0));
+  server.close();
+  // Let a journal write that is in progress finish, then stop.
+  journal.idle().finally(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));

@@ -6,20 +6,48 @@ const esc = (s) =>
   );
 // CSRF token of the current staff or attendee session. Kept in memory only.
 let csrfToken = "";
+// opts.timeoutMs aborts a request that gets no answer; the error then has
+// status 0, like any other network failure (the outcome is unknown).
 const api = async (url, opts = {}) => {
-  const r = await fetch(url, {
-    credentials: "same-origin",
-    ...opts,
-    headers: {
-      "content-type": "application/json",
-      ...(csrfToken ? { "x-csrf-token": csrfToken } : {}),
-      ...(opts.headers || {}),
-    },
-  });
-  const d = (r.headers.get("content-type") || "").includes("json") ? await r.json() : await r.text();
-  if (!r.ok) throw Object.assign(Error(d?.error || "Error " + r.status), { status: r.status });
+  const { timeoutMs, ...fetchOpts } = opts;
+  const controller = timeoutMs ? new AbortController() : null,
+    timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  let r;
+  try {
+    r = await fetch(url, {
+      credentials: "same-origin",
+      ...fetchOpts,
+      ...(controller ? { signal: controller.signal } : {}),
+      headers: {
+        "content-type": "application/json",
+        ...(csrfToken ? { "x-csrf-token": csrfToken } : {}),
+        ...(fetchOpts.headers || {}),
+      },
+    });
+  } catch {
+    throw Object.assign(Error("The connection was interrupted."), { status: 0 });
+  } finally {
+    clearTimeout(timer);
+  }
+  let d;
+  try {
+    d = (r.headers.get("content-type") || "").includes("json") ? await r.json() : await r.text();
+  } catch {
+    d = null;
+  }
+  if (!r.ok)
+    throw Object.assign(Error(d?.error || "Error " + r.status), {
+      status: r.status,
+      retryAfter: Number(r.headers.get("retry-after")) || d?.retryAfter || 0,
+      data: d,
+    });
   return d;
 };
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const newClientId = () =>
+  crypto.randomUUID
+    ? crypto.randomUUID()
+    : Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
 const storage = {
   get(store, key) {
     try {
@@ -223,9 +251,9 @@ const guestHeaders = (s) => {
 const guestApi = (s, action, opts = {}) =>
   api(eventApi(s) + "/" + action, { ...opts, headers: { ...guestHeaders(s), ...(opts.headers || {}) } });
 const privateHeaders = (s) => ({ "x-private-token": privateTokens.get(s) || "" });
-async function loadGuestSession(s) {
+async function loadGuestSession(s, light = false) {
   try {
-    const d = await guestApi(s, "session");
+    const d = await guestApi(s, "session" + (light ? "?light=1" : ""));
     csrfToken = d.csrf;
     return d;
   } catch (e) {
@@ -236,11 +264,19 @@ async function loadGuestSession(s) {
     throw e;
   }
 }
+// The join answer includes the history and the first stream ticket, so the
+// chat can open without further requests (handed over through joinedNow).
+const joinedNow = new Map();
 async function joinChat(s, details) {
   const d = await guestApi(s, "join", { method: "POST", body: JSON.stringify(details) });
   csrfToken = d.csrf;
-  const check = await loadGuestSession(s);
-  if (check) return check;
+  try {
+    await guestApi(s, "session?light=1");
+    joinedNow.set(s, d);
+    return d;
+  } catch (e) {
+    if (e.status !== 401) throw e;
+  }
   // The cookie was not stored: use the per-tab fallback.
   const fallback = await api(eventApi(s) + "/join", {
     method: "POST",
@@ -248,7 +284,42 @@ async function joinChat(s, details) {
   });
   storage.set("sessionStorage", guestTokenKey(s), fallback.sessionToken);
   csrfToken = fallback.csrf;
+  joinedNow.set(s, fallback);
   return fallback;
+}
+// Send a message so that it is placed at most once: the same clientMessageId
+// is reused for every retry, and after an unknown outcome (time-out, lost
+// connection, 502/504) the server is asked what happened first.
+async function sendChatMessage(s, payload, headers = {}, onRetry = () => {}) {
+  const clientMessageId = newClientId(),
+    body = JSON.stringify({ ...payload, clientMessageId });
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      return await guestApi(s, "messages", { method: "POST", body, headers, timeoutMs: 15000 });
+    } catch (e) {
+      // A definite answer (400/401/403/409/429): nothing more to do.
+      if (e.status >= 400 && e.status < 500) throw e;
+      onRetry();
+      if (e.status === 503) {
+        // Refused before storing; safe to retry after the advised wait.
+        await sleep(Math.min(10, e.retryAfter || 2) * 1000);
+        continue;
+      }
+      try {
+        const st = await guestApi(
+          s,
+          "messages/status?clientMessageId=" + encodeURIComponent(clientMessageId),
+          {
+            timeoutMs: 10000,
+          },
+        );
+        if (st.status === "accepted")
+          return { ok: true, recovered: true, status: st.message.status, message: st.message };
+      } catch {}
+      await sleep(1000 * 2 ** attempt);
+    }
+  }
+  throw Error("Your message could not be sent. Please try again.");
 }
 async function leaveChat(s) {
   try {
@@ -324,14 +395,19 @@ async function publicPage(s) {
     return showCenter(e.message);
   }
   if (event.chatEnabled === false) return showCenter("Chat is disabled.");
-  let session;
+  let session = joinedNow.get(s);
+  joinedNow.delete(s);
   try {
-    session = await loadGuestSession(s);
-    if (!session && event.mode === "readonly") session = await joinChat(s, { name: "Guest" });
+    session ||= await loadGuestSession(s);
+    if (!session && event.mode === "readonly") {
+      session = await joinChat(s, { name: "Guest" });
+      joinedNow.delete(s);
+    }
   } catch (e) {
     return showCenter(e.message);
   }
   if (!session) return joinForm(s, event);
+  let firstTicket = session.ticket || "";
   event = session.event || event;
   const readOnly = event.mode === "readonly",
     privateEnabled = event.privateMessagesEnabled !== false;
@@ -405,12 +481,15 @@ async function publicPage(s) {
   });
   document.querySelector("#send")?.addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    const input = ev.target.elements.text;
-    if (!input.value.trim()) return;
+    const form = ev.target,
+      input = form.elements.text,
+      button = form.querySelector("button");
+    if (!input.value.trim() || button.disabled) return;
+    button.disabled = true;
+    notice.textContent = "Sending…";
     try {
-      const d = await guestApi(s, "messages", {
-        method: "POST",
-        body: JSON.stringify({ text: input.value, kind: "public" }),
+      const d = await sendChatMessage(s, { text: input.value, kind: "public" }, {}, () => {
+        notice.textContent = "Sending…";
       });
       notice.textContent =
         d.status === "published"
@@ -420,6 +499,8 @@ async function publicPage(s) {
     } catch (e) {
       notice.textContent = e.message;
       if (e.status === 401) setTimeout(() => render(), 1500);
+    } finally {
+      button.disabled = false;
     }
   });
   const endAccess = (message) => {
@@ -428,7 +509,13 @@ async function publicPage(s) {
     document.querySelector("#send")?.remove();
   };
   activeStream = openStream(
-    () => ticketUrl(s, "public"),
+    () => {
+      // First connection uses the ticket from the join; reconnects get a new one.
+      if (!firstTicket) return ticketUrl(s, "public");
+      const url = eventApi(s) + "/stream?ticket=" + encodeURIComponent(firstTicket);
+      firstTicket = "";
+      return Promise.resolve(url);
+    },
     {
       ready: (ev) => {
         const d = JSON.parse(ev.data);
@@ -484,7 +571,7 @@ async function privatePage(s) {
   let event, session;
   try {
     event = (await api(eventApi(s))).event;
-    session = await loadGuestSession(s);
+    session = await loadGuestSession(s, true);
   } catch (e) {
     return showCenter(e.message);
   }
@@ -649,18 +736,21 @@ async function privatePage(s) {
       ev.preventDefault();
       const input = ev.target.elements.text;
       if (!input.value.trim()) return;
+      const button = ev.target.querySelector("button");
+      if (button.disabled) return;
+      button.disabled = true;
+      notice.textContent = "Sending…";
       try {
-        const d = await guestApi(s, "messages", {
-          method: "POST",
-          body: JSON.stringify({ text: input.value, kind: "private" }),
-          headers: privateHeaders(s),
-        });
-        add(d.message);
+        const d = await sendChatMessage(s, { text: input.value, kind: "private" }, privateHeaders(s));
+        // A recovered message carries no text; it arrives on the private stream.
+        if (!d.recovered) add(d.message);
         input.value = "";
         notice.textContent = "Your private message has been sent to the moderators.";
       } catch (e) {
         if (e.status === 401) return locked("Locked for your privacy. Enter your PIN to continue.");
         notice.textContent = e.message;
+      } finally {
+        button.disabled = false;
       }
     });
   };

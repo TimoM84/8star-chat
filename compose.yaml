@@ -1,11 +1,12 @@
-# 8star Chat v0.6.0 — Compose stack for Dockhand / docker compose.
+# 8star Chat v0.7.0 — Compose stack (Dockhand / docker compose) for Helios.
 #
-# The image is built on the Docker host from the release source
-# (see README: "Install or update on the server"). Keep the service name,
-# volume name and stack name unchanged so the existing data volume is reused.
+# The image is built on the Docker host from the release source:
+#   docker build -t 8star-chat:0.7.0 <release directory>
+# Keep the project/stack name, the service name and the volume name unchanged
+# so the existing data volume (8star_chat_data) is reused.
 services:
   8star-chat:
-    image: 8star-chat:0.6.0
+    image: 8star-chat:0.7.0
     pull_policy: never
     restart: unless-stopped
     ports:
@@ -17,13 +18,25 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in Dockhand}
       DEFAULT_MAX_USERS: ${DEFAULT_MAX_USERS:-10000}
       MAX_MESSAGE_LENGTH: ${MAX_MESSAGE_LENGTH:-500}
-      ROOM_PUBLISH_PER_SECOND: ${ROOM_PUBLISH_PER_SECOND:-5}
+      # Production currently runs with 50 accepted public messages per second
+      # per event. This release does not change that value.
+      ROOM_PUBLISH_PER_SECOND: ${ROOM_PUBLISH_PER_SECOND:-50}
       FRAME_ANCESTORS: "${FRAME_ANCESTORS:-*}"
       TRUST_PROXY: ${TRUST_PROXY:-true}
       COOKIE_SECURE: ${COOKIE_SECURE:-auto}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
       GUEST_SESSION_HOURS: ${GUEST_SESSION_HOURS:-24}
       PRIVATE_UNLOCK_IDLE_SECONDS: ${PRIVATE_UNLOCK_IDLE_SECONDS:-900}
+      # New in 0.7.0 (defaults shown; see README "Settings").
+      JOURNAL_FSYNC: ${JOURNAL_FSYNC:-true}
+      FANOUT_INTERVAL_MS: ${FANOUT_INTERVAL_MS:-100}
+      OVERLOAD_LAG_MS: ${OVERLOAD_LAG_MS:-1000}
+      MAX_PENDING_MESSAGES: ${MAX_PENDING_MESSAGES:-1000}
+      MAX_PENDING_EVENTS: ${MAX_PENDING_EVENTS:-5000}
+      SSE_MAX_BUFFER_KB: ${SSE_MAX_BUFFER_KB:-256}
+      LISTEN_BACKLOG: ${LISTEN_BACKLOG:-4096}
+      # One JSON line with counts and timings per minute in `docker logs`.
+      METRICS_LOG_SECONDS: ${METRICS_LOG_SECONDS:-60}
     volumes:
       - 8star_chat_data:/data
     # Each live attendee holds one open connection (Server-Sent Events).

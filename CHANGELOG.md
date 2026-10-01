@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.7.0
+
+### Behaviour under peak load
+
+- **Measured cause of the v0.6.0 problem:** every accepted message was written to every open stream inside the request. One write to 5,000 streams costs 60–95 ms (almost all in the `writev` system call; a CPU profile showed 13.9 s there during a burst). At 50 messages per second that is more work than one core can do, so requests waited up to 24 s inside the server, the accept queue overflowed, the proxy reported `Connection reset by peer` / `upstream timed out`, and messages accepted late were published while the sender had already given up.
+- Live updates to attendees are queued per event and written in batches (at most one write per connection per `FANOUT_INTERVAL_MS`, default 100 ms) in slices, so the server keeps answering requests during delivery. Order is preserved.
+- Limits answer immediately: `429` (per attendee, per event) and `503` (overload, storage) with `Retry-After`. Bounded queues: `MAX_PENDING_MESSAGES`, `MAX_PENDING_EVENTS`, `SSE_MAX_BUFFER_KB` (default lowered from 1 MB to 256 kB). Listen backlog 4096 (`LISTEN_BACKLOG`).
+- The public message event for attendees only contains what the chat shows (206 instead of 294 bytes for an 80-character message).
+
+### Reliable confirmation
+
+- Messages carry a `clientMessageId`. The same id from the same session never creates a second message (`200` with the original message); a different text with the same id is `409`.
+- `GET /api/events/<slug>/messages/status?clientMessageId=…` tells the sending session whether a message was accepted, without returning its text.
+- The browser retries after a time-out, lost connection or 5xx with the same id and checks the status first, so a message is never published twice and the sender learns the outcome.
+- Messages are written to a journal (`messages-N.journal`, group commit, `fdatasync`) **before** they are confirmed or shown. A confirmed message survives a crash; the journal is replayed at start-up and removed after the next snapshot. `JOURNAL_FSYNC=false` skips the `fdatasync`.
+
+### Joining
+
+- The join answer contains the first stream ticket (one round trip less); the stream then only sends what was published after the join.
+- Static files are served with ETags (`304` on revalidation) and gzip/brotli compression.
+- Test clients may ask for a shorter session (`sessionMinutes`); never longer than `GUEST_SESSION_HOURS`.
+
+### Interface
+
+- English is the default interface language for everyone; a language chosen with the picker is remembered.
+- The send button shows "Sending…" and is disabled while a message is on its way.
+
+### Measuring
+
+- `METRICS_LOG_SECONDS`: one JSON line with counts and timings in the container log (no message text, names, cookies or tokens).
+- `scripts/loadtest.js` rewritten: multi-process, browser-like or proxy-like connections, exact accounting of published ids, duplicates, deliveries and recovery, abort-safe session clean-up.
+- `scripts/e2e-burst.js`: pass/fail end-to-end burst test. `scripts/probe.js`: measurement preload for any version. `docs/load-testing.md`.
+
+### Compatibility
+
+- Data from v0.6.0 is used as is. Rolling back to v0.6.0 after a clean stop is possible (the snapshot then contains every confirmed message; v0.6.0 ignores the extra `clientKey` field and does not read journal files).
+- Clients of v0.6.0 that send without `clientMessageId` still work (without idempotency).
+
 ## v0.6.0
 
 ### Security and privacy
