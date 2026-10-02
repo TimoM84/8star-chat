@@ -226,3 +226,7 @@ npm run check:i18n    # missing, unused or untranslated interface texts
 ```
 
 Translations live in `public/i18n-core.js` (English text is the key, followed by Dutch, German and French). Code is formatted with Prettier (`npx prettier --write .`). Load-test tools are described in [docs/load-testing.md](docs/load-testing.md).
+
+## License
+
+Copyright © 2026 Timo Manders. All rights reserved. Use, copying, modification or distribution is only permitted with prior written permission. See [LICENSE](LICENSE).

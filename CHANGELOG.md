@@ -6,6 +6,10 @@
 
 - New README with screenshots of the attendee chat, private conversation, moderator console, speaker queue and event overview, a Compose quick start and a social preview image (`docs/screenshots/`). The detailed privacy, message-handling and capacity sections moved unchanged to `docs/architecture.md`.
 
+### License
+
+- Added `LICENSE`: all rights reserved; use, copying, modification or distribution only with prior written permission. The source code stays publicly visible.
+
 ### Interface
 
 - The "waiting" counter on the speaker page is no longer stretched across the header.

@@ -3,6 +3,8 @@
   "version": "0.7.1",
   "private": true,
   "description": "White-label live event chat with moderation and stage monitor",
+  "license": "UNLICENSED",
+  "author": "Timo Manders",
   "scripts": {
     "start": "node server.js",
     "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
