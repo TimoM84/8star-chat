@@ -265,9 +265,13 @@ async function homePage() {
               encodeURIComponent(e.slug) +
               '"><button class="secondary small">Go to public chat</button></a><a href="/moderator/' +
               encodeURIComponent(e.slug) +
-              '"><button class="small">Moderate</button></a><a href="/stage/' +
-              encodeURIComponent(e.slug) +
-              '" target="_blank" rel="noreferrer"><button class="secondary small">Stage login</button></a><button class="secondary small" data-copy="<iframe src=&quot;' +
+              '"><button class="small">Moderate</button></a>' +
+              (me.role === "moderator"
+                ? ""
+                : '<a href="/stage/' +
+                  encodeURIComponent(e.slug) +
+                  '" target="_blank" rel="noreferrer"><button class="secondary small">Stage login</button></a>') +
+              '<button class="secondary small" data-copy="<iframe src=&quot;' +
               location.origin +
               "/e/" +
               esc(e.slug) +
@@ -976,6 +980,12 @@ async function securedPage(type, s) {
     return;
   }
   if (type === "moderator") return moderatorPage(event, me);
+  // The stage screen shows the whole speaker queue: stage accounts and the
+  // event owner only (or a secure stage link).
+  if (me.role === "moderator") {
+    app.innerHTML = '<div class="center">Stage access required.</div>';
+    return;
+  }
   return stagePage(event, me, "");
 }
 async function moderatorPage(event, me) {
@@ -985,8 +995,10 @@ async function moderatorPage(event, me) {
     messages = loaded.messages,
     threadStates = loaded.privateThreads || {},
     pins = loaded.pins || [],
-    team = (await api(endpoint + "/moderators")).users,
-    bans = (await api(endpoint + "/bans")).bans,
+    // Team and blocked users are managed by the event owner; a moderator only
+    // works on what is assigned to them.
+    team = canManage ? (await api(endpoint + "/moderators")).users : [],
+    bans = canManage ? (await api(endpoint + "/bans")).bans : [],
     trustProxy = loaded.trustProxy;
   try {
     Object.assign(event, (await api(endpoint + "/settings")).event);
@@ -995,7 +1007,8 @@ async function moderatorPage(event, me) {
     privateStatus = "open",
     privatePage = 0,
     query = "",
-    terms = [];
+    terms = [],
+    assigneeFilter = "";
   // Long lists are shown in steps, so a busy event stays quick on an iPad.
   const STEP = 50,
     shown = { inbox: STEP, archive: STEP };
@@ -1027,15 +1040,23 @@ async function moderatorPage(event, me) {
     esc(roleName(me.role)) +
     '</div></div><div class="stats"><div class="stat">Limit ' +
     event.capacity.toLocaleString() +
-    '</div></div></div><div class="console-nav"><div class="tabs" role="tablist">' +
+    "</div></div></div>" +
+    (canManage
+      ? ""
+      : '<p class="scope-note">You only see the questions and private conversations that are assigned to you.</p>') +
+    '<div class="console-nav"><div class="tabs" role="tablist">' +
     [
       ["inbox", "Inbox"],
       ["private", "Private messages"],
       ["archive", "Published / archive"],
       ["stage", "Stage / cues"],
-      ["team", "Team"],
-      ["bans", "Blocked users"],
-      ["settings", "Settings"],
+      ...(canManage
+        ? [
+            ["team", "Team"],
+            ["bans", "Blocked users"],
+            ["settings", "Settings"],
+          ]
+        : []),
     ]
       .map(
         ([id, label]) =>
@@ -1050,7 +1071,16 @@ async function moderatorPage(event, me) {
           '" hidden></span></button>',
       )
       .join("") +
-    '</div><div class="console-search" role="search"><input type="search" id="console-search" autocomplete="off" enterkeyhint="search" aria-label="Search messages, names and topics" placeholder="Search messages, names and topics…"></div></div><div id="panel"></div></main>';
+    '</div><div class="console-search" role="search"><input type="search" id="console-search" autocomplete="off" enterkeyhint="search" aria-label="Search messages, names and topics" placeholder="Search messages, names and topics…">' +
+    (canManage
+      ? '<select id="assignee-filter" aria-label="Filter by moderator"><option value="">All moderators</option><option value="none">Not assigned</option>' +
+        team
+          .filter((u) => u.role === "moderator")
+          .map((u) => '<option data-user-content value="' + esc(u.id) + '">' + esc(u.email) + "</option>")
+          .join("") +
+        "</select>"
+      : "") +
+    '</div></div><div id="panel"></div></main>';
   document.querySelector("#logout").onclick = async () => {
     await api("/api/logout", { method: "POST", body: "{}" });
     csrfToken = "";
@@ -1061,11 +1091,49 @@ async function moderatorPage(event, me) {
     messages = loaded.messages;
     threadStates = loaded.privateThreads || {};
     pins = loaded.pins || [];
-    if (withBans) bans = (await api(endpoint + "/bans")).bans;
+    if (withBans && canManage) bans = (await api(endpoint + "/bans")).bans;
     trustProxy = loaded.trustProxy;
   };
   const topicList = () => [...new Set(team.flatMap((u) => u.topics || []))],
-    personName = (id) => team.find((u) => u.id === id)?.email || "Unassigned",
+    activeModerators = () => team.filter((u) => u.role === "moderator" && u.active),
+    assigneeName = (id) => team.find((u) => u.id === id)?.email || "",
+    // Assignment label for the event owner (assigned moderator or none).
+    assignPill = (id) =>
+      !canManage
+        ? ""
+        : id && assigneeName(id)
+          ? '<span class="pill assign-pill"><span>Assigned to</span> <b data-user-content>' +
+            esc(assigneeName(id)) +
+            "</b></span>"
+          : '<span class="pill assign-pill unassigned">Not assigned</span>',
+    // Owner only: choose a moderator, then "Forward".
+    forwardControls = (current, scope) =>
+      '<div class="forward"><label>Forward to moderator</label><div class="forward-row"><select data-assignee aria-label="Forward to moderator"><option value="">Select moderator</option>' +
+      activeModerators()
+        .map(
+          (u) =>
+            '<option data-user-content value="' +
+            esc(u.id) +
+            '"' +
+            (current === u.id ? " selected" : "") +
+            ">" +
+            esc(u.email) +
+            (u.topics?.length ? " · " + esc(u.topics.join(", ")) : "") +
+            "</option>",
+        )
+        .join("") +
+      '</select><button type="button" class="small" data-' +
+      scope +
+      '="assign">Forward</button>' +
+      (current
+        ? '<button type="button" class="secondary small" data-' +
+          scope +
+          '="unassign">Remove assignment</button>'
+        : "") +
+      "</div>" +
+      (activeModerators().length ? "" : '<div class="hint">Add a moderator in Team first.</div>') +
+      "</div>",
+    assigneeOk = (id) => !assigneeFilter || (assigneeFilter === "none" ? !id : id === assigneeFilter),
     isBlocked = (participantId) =>
       Boolean(participantId && bans.some((x) => x.participantId === participantId));
   const pinControls = (m) => {
@@ -1088,30 +1156,21 @@ async function moderatorPage(event, me) {
         : '<button class="danger small" data-act="ban">Block participant</button>'
       : "") +
     (m.ipAvailable ? '<button class="danger small" data-act="ban-ip">Block IP address</button>' : "");
-  const questionCard = (m) => {
-    const routing = isOwner
-      ? '<div class="assignment row"><div><label>Topic / area</label><input data-topic list="topic-list" value="' +
+  // Topic and "Forward to moderator" for the owner; the topic for a moderator.
+  const routingBlock = (m) =>
+    isOwner
+      ? '<div class="assignment"><div><label>Topic / area</label><input data-topic list="topic-list" value="' +
         esc(m.topic || "") +
-        '" placeholder="e.g. Delta works or infrastructure"></div><div><label>Assign to moderator</label><select data-assignee><option value="">Unassigned</option>' +
-        team
-          .filter((u) => u.role === "moderator" && u.active)
-          .map(
-            (u) =>
-              '<option data-user-content value="' +
-              esc(u.id) +
-              '" ' +
-              (m.assignedTo === u.id ? "selected" : "") +
-              ">" +
-              esc(u.email) +
-              (u.topics?.length ? " · " + esc(u.topics.join(", ")) : "") +
-              "</option>",
-          )
-          .join("") +
-        '</select></div><button class="secondary small" data-act="assign">Save assignment</button></div>'
-      : '<div class="muted assignment-summary">' +
-        (m.topic ? "<span data-user-content>" + highlight(m.topic, terms) + "</span> · " : "") +
-        esc(personName(m.assignedTo)) +
-        "</div>";
+        '" placeholder="e.g. Delta works or infrastructure"></div>' +
+        forwardControls(m.assignedTo || "", "act") +
+        "</div>"
+      : m.topic
+        ? '<div class="muted assignment-summary"><span data-user-content>' +
+          highlight(m.topic, terms) +
+          "</span></div>"
+        : "";
+  const questionCard = (m) => {
+    const routing = routingBlock(m);
     const buttons =
       m.type === "private"
         ? '<span class="pill">Private conversation</span>'
@@ -1125,7 +1184,9 @@ async function moderatorPage(event, me) {
       (m.language ? ' <span class="pill" data-user-content>' + esc(m.language) + "</span>" : "") +
       ' <span class="pill">' +
       (m.type === "private" ? "Private" : "Public") +
-      '</span></b><span class="muted">' +
+      "</span> " +
+      assignPill(m.assignedTo) +
+      '</b><span class="muted">' +
       time(m.createdAt) +
       "</span></div><p>" +
       highlight(m.text, terms) +
@@ -1149,12 +1210,14 @@ async function moderatorPage(event, me) {
             act = b.dataset.act;
           try {
             if (act === "stage-remove" && !confirm("Remove this item from the speaker queue?")) return;
-            if (act === "assign") {
+            if (act === "assign" || act === "unassign") {
+              const assignedTo = act === "assign" ? card.querySelector("[data-assignee]").value : "";
+              if (act === "assign" && !assignedTo) return alert("Select a moderator first.");
               await api(endpoint + "/messages/" + encodeURIComponent(m.id) + "/assign", {
                 method: "POST",
                 body: JSON.stringify({
-                  topic: card.querySelector("[data-topic]").value,
-                  assignedTo: card.querySelector("[data-assignee]").value,
+                  topic: card.querySelector("[data-topic]")?.value ?? m.topic ?? "",
+                  assignedTo,
                 }),
               });
             } else if (act === "ban") {
@@ -1271,11 +1334,15 @@ async function moderatorPage(event, me) {
   // What each tab lists, filtered by the search query.
   const hit = (m) => matchesAll(terms, m.author, m.text, m.topic, m.language);
   const lists = {
-    inbox: () => messages.filter((m) => m.status === "pending" && m.type === "question" && hit(m)),
+    inbox: () =>
+      messages.filter(
+        (m) => m.status === "pending" && m.type === "question" && hit(m) && assigneeOk(m.assignedTo),
+      ),
     private: () =>
       privateThreads().filter(
         (t) =>
           (privateStatus === "all" || t.status === privateStatus) &&
+          assigneeOk(threadStates[t.id]?.assignedTo) &&
           (!terms.length ||
             matchesAll(
               terms,
@@ -1285,10 +1352,20 @@ async function moderatorPage(event, me) {
       ),
     archive: () =>
       messages.filter(
-        (m) => ["published", "withdrawn"].includes(m.status) && m.type === "question" && hit(m),
+        (m) =>
+          ["published", "withdrawn"].includes(m.status) &&
+          m.type === "question" &&
+          hit(m) &&
+          assigneeOk(m.assignedTo),
       ),
     announcements: () => pins.filter((m) => m.type === "announcement" && hit(m)),
-    stage: () => messages.filter((m) => m.stageState === "queued" && hit(m)),
+    stage: () =>
+      messages.filter(
+        (m) =>
+          m.stageState === "queued" &&
+          hit(m) &&
+          (m.type === "question" ? assigneeOk(m.assignedTo) : !assigneeFilter),
+      ),
     replies: () => messages.filter((m) => m.type === "stage-reply" && hit(m)),
     team: () => team.filter((u) => matchesAll(terms, u.email, roleName(u.role), ...(u.topics || []))),
     bans: () => bans.filter((b) => matchesAll(terms, b.name, b.by)),
@@ -1362,7 +1439,9 @@ async function moderatorPage(event, me) {
           (privateOpen.has(t.id) || (terms.length && filtered.length <= 5) ? "open" : "") +
           '><summary class="private-thread-summary"><div class="private-summary-main"><b data-user-content>' +
           highlight(attendee, terms) +
-          '</b><span class="muted">' +
+          "</b>" +
+          assignPill(threadStates[t.id]?.assignedTo) +
+          '<span class="muted">' +
           esc(statusName(t.status)) +
           " · " +
           t.messages.length +
@@ -1370,7 +1449,9 @@ async function moderatorPage(event, me) {
           time(last.createdAt) +
           '</span><span class="thread-preview" data-user-content>' +
           highlight(last.text, terms) +
-          '</span></div></summary><div class="private-thread-content"><div class="muted">Last message by <span data-user-content>' +
+          '</span></div></summary><div class="private-thread-content">' +
+          (isOwner ? forwardControls(threadStates[t.id]?.assignedTo || "", "thread") : "") +
+          '<div class="muted">Last message by <span data-user-content>' +
           esc(who) +
           '</span></div><div class="private-transcript">' +
           t.messages
@@ -1474,6 +1555,28 @@ async function moderatorPage(event, me) {
             }
           }),
       );
+      p.querySelectorAll("[data-thread]").forEach(
+        (button) =>
+          (button.onclick = async () => {
+            const card = button.closest("[data-thread-card]"),
+              assignedTo =
+                button.dataset.thread === "assign" ? card.querySelector("[data-assignee]").value : "";
+            if (button.dataset.thread === "assign" && !assignedTo) return alert("Select a moderator first.");
+            try {
+              await api(
+                endpoint + "/conversations/" + encodeURIComponent(card.dataset.threadCard) + "/assign",
+                {
+                  method: "POST",
+                  body: JSON.stringify({ assignedTo }),
+                },
+              );
+              await refresh();
+              draw();
+            } catch (e) {
+              alert(e.message);
+            }
+          }),
+      );
       p.querySelectorAll("[data-thread-action]").forEach(
         (button) =>
           (button.onclick = async () => {
@@ -1524,9 +1627,11 @@ async function moderatorPage(event, me) {
             '<div class="queue">' +
             announcementList +
             "</div></section>") +
-        '<section class="card"><div class="section-head"><div><h2>Published questions and archive</h2><p class="muted">Withdraw, republish, send questions to speakers, pin key messages, and manage participant access.</p></div><a href="' +
-        endpoint +
-        '/export"><button class="secondary">Export full chat CSV</button></a></div>' +
+        '<section class="card"><div class="section-head"><div><h2>Published questions and archive</h2><p class="muted">Withdraw, republish, send questions to speakers, pin key messages, and manage participant access.</p></div>' +
+        (isOwner
+          ? '<a href="' + endpoint + '/export"><button class="secondary">Export full chat CSV</button></a>'
+          : "") +
+        "</div>" +
         (isOwner
           ? '<datalist id="topic-list">' +
             topicList()
@@ -1551,11 +1656,15 @@ async function moderatorPage(event, me) {
               (m.status === "published" ? "Published" : "Withdrawn") +
               "</span>" +
               (m.stageState ? '<span class="pill">Stage: ' + esc(statusName(m.stageState)) + "</span>" : "") +
+              " " +
+              assignPill(m.assignedTo) +
               '</b><span class="muted">' +
               time(m.createdAt) +
               "</span></div><p>" +
               highlight(m.text, terms) +
-              '</p><div class="question-actions">' +
+              "</p>" +
+              routingBlock(m) +
+              '<div class="question-actions">' +
               (m.status === "published"
                 ? '<button class="secondary small" data-act="withdraw">Withdraw from public chat</button>'
                 : '<button class="small" data-act="publish">Republish</button>') +
@@ -1639,13 +1748,13 @@ async function moderatorPage(event, me) {
               '</p><button class="danger small" data-act="stage-remove">Remove from speaker queue</button></article>',
           )
           .join("") || '<div class="empty">Nothing waiting for the speaker.</div>') +
-        '</div><form id="cue"><label>Send a note to the speaker</label><textarea name="text" maxlength="500" required placeholder="Message for the speaker…"></textarea><button style="margin-top:10px">Add stage cue</button></form><div class="toolbar" style="margin-top:14px"><a href="/stage/' +
-        encodeURIComponent(event.slug) +
-        '" target="_blank" rel="noreferrer"><button class="secondary small">Open stage login</button></a>' +
+        '</div><form id="cue"><label>Send a note to the speaker</label><textarea name="text" maxlength="500" required placeholder="Message for the speaker…"></textarea><button style="margin-top:10px">Add stage cue</button></form>' +
         (isOwner
-          ? '<button class="secondary small" id="make-stage-link">Create secure stage link + QR</button>'
+          ? '<div class="toolbar" style="margin-top:14px"><a href="/stage/' +
+            encodeURIComponent(event.slug) +
+            '" target="_blank" rel="noreferrer"><button class="secondary small">Open stage login</button></a><button class="secondary small" id="make-stage-link">Create secure stage link + QR</button></div><div id="stage-link-result"></div>'
           : "") +
-        '</div><div id="stage-link-result"></div></section><section class="card"><h2>Private messages from stage</h2><div class="queue">' +
+        '</section><section class="card"><h2>Private messages from stage</h2><div class="queue">' +
         (replies || '<div class="empty">No messages yet.</div>') +
         "</div></section></div>";
       document.querySelector("#cue").onsubmit = async (ev) => {
@@ -1887,6 +1996,12 @@ async function moderatorPage(event, me) {
     shown[more.dataset.more] += STEP;
     draw();
   });
+  document.querySelector("#assignee-filter")?.addEventListener("change", (ev) => {
+    assigneeFilter = ev.target.value;
+    shown.inbox = shown.archive = STEP;
+    privatePage = 0;
+    draw();
+  });
   const searchInput = document.querySelector("#console-search");
   let searchTimer = null;
   searchInput.addEventListener("input", () => {
@@ -1958,10 +2073,8 @@ async function moderatorPage(event, me) {
     Object.assign(event, next);
     if (tab === "settings") draw();
   });
-  es.addEventListener("stage-reply", (ev) => {
-    messages.push(JSON.parse(ev.data));
-    if (tab === "stage") drawWhenIdle();
-  });
+  // Moderator connections only carry signals; the content is reloaded.
+  es.addEventListener("stage-reply", refreshAndDraw);
 }
 async function stagePage(event, me, access) {
   document.body.dataset.page = "stage";

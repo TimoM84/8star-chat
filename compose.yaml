@@ -1,4 +1,4 @@
-# 8star Chat v0.8.0 — Compose stack for Dockhand ("From Git") or docker compose.
+# 8star Chat v1.0.0 — Compose stack for Dockhand ("From Git") or docker compose.
 #
 # The image is built from the repository checkout this file is in, so a
 # Dockhand Git stack (repository + tag + compose.yaml) builds and deploys in
@@ -10,7 +10,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: 8star-chat:0.8.0
+    image: 8star-chat:1.0.0
     restart: unless-stopped
     ports:
       - "9876:3000"

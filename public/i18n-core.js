@@ -206,10 +206,9 @@
     ["Send to stage", "Naar het podium sturen", "An die Bühne senden", "Envoyer à la scène"],
     ["Reject", "Afwijzen", "Ablehnen", "Rejeter"],
     ["Private conversation", "Privégesprek", "Privates Gespräch", "Conversation privée"],
-    ["Unassigned", "Niet toegewezen", "Nicht zugewiesen", "Non attribué"],
+
     ["Topic / area", "Onderwerp / onderdeel", "Thema / Bereich", "Sujet / domaine"],
-    ["Assign to moderator", "Toewijzen aan moderator", "Moderator zuweisen", "Attribuer à un modérateur"],
-    ["Save assignment", "Toewijzing opslaan", "Zuweisung speichern", "Enregistrer l’attribution"],
+
     [
       "e.g. Delta works or infrastructure",
       "bijv. Deltawerken of infrastructuur",
@@ -1133,6 +1132,61 @@
       "Geen overeenkomende vragen.",
       "Keine passenden Fragen.",
       "Aucune question correspondante.",
+    ],
+    ["Not assigned", "Niet toegewezen", "Nicht zugewiesen", "Non attribuée"],
+    ["Filter by moderator", "Filteren op moderator", "Nach Moderator filtern", "Filtrer par modérateur"],
+    ["All moderators", "Alle moderators", "Alle Moderatoren", "Tous les modérateurs"],
+    ["Assigned to", "Toegewezen aan", "Zugewiesen an", "Attribuée à"],
+    ["Forward", "Doorzetten", "Weiterleiten", "Transférer"],
+    [
+      "Forward to moderator",
+      "Doorzetten naar moderator",
+      "An Moderator weiterleiten",
+      "Transférer à un modérateur",
+    ],
+    ["Select moderator", "Selecteer moderator", "Moderator auswählen", "Sélectionner un modérateur"],
+    ["Remove assignment", "Toewijzing intrekken", "Zuweisung aufheben", "Retirer l’attribution"],
+    [
+      "Add a moderator in Team first.",
+      "Voeg eerst een moderator toe onder Team.",
+      "Füge zuerst unter Team einen Moderator hinzu.",
+      "Ajoutez d’abord un modérateur dans Équipe.",
+    ],
+    [
+      "Select a moderator first.",
+      "Selecteer eerst een moderator.",
+      "Wähle zuerst einen Moderator aus.",
+      "Sélectionnez d’abord un modérateur.",
+    ],
+    [
+      "You only see the questions and private conversations that are assigned to you.",
+      "Je ziet alleen de vragen en privégesprekken die aan jou zijn toegewezen.",
+      "Du siehst nur die Fragen und privaten Gespräche, die dir zugewiesen sind.",
+      "Vous ne voyez que les questions et conversations privées qui vous sont attribuées.",
+    ],
+    [
+      "Only the event owner can change the settings.",
+      "Alleen de eigenaar kan de instellingen wijzigen.",
+      "Nur der Veranstaltungsinhaber kann die Einstellungen ändern.",
+      "Seul le propriétaire peut modifier les paramètres.",
+    ],
+    [
+      "Assign private messages through their conversation.",
+      "Wijs privéberichten toe via hun gesprek.",
+      "Weise private Nachrichten über ihr Gespräch zu.",
+      "Attribuez les messages privés via leur conversation.",
+    ],
+    [
+      "Only the event owner can manage blocked users.",
+      "Alleen de eigenaar kan geblokkeerde gebruikers beheren.",
+      "Nur der Veranstaltungsinhaber kann gesperrte Personen verwalten.",
+      "Seul le propriétaire peut gérer les utilisateurs bloqués.",
+    ],
+    [
+      "Only the event owner can export the chat.",
+      "Alleen de eigenaar kan de chat exporteren.",
+      "Nur der Veranstaltungsinhaber kann den Chat exportieren.",
+      "Seul le propriétaire peut exporter le chat.",
     ],
   ];
   const languages = ["en", "nl", "de", "fr"];

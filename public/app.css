@@ -1448,3 +1448,74 @@ mark {
   flex: 1;
   min-width: 0;
 }
+
+/* ---- Assignment to moderators -------------------------------------------- */
+.scope-note {
+  margin: -8px 0 16px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: 14px;
+}
+.assign-pill {
+  gap: 4px;
+  color: var(--text);
+  border-color: var(--text);
+  font-weight: 600;
+}
+.assign-pill b {
+  font-weight: 700;
+}
+.assign-pill.unassigned {
+  color: var(--muted);
+  border-color: var(--line);
+  border-style: dashed;
+}
+.private-summary-main .assign-pill {
+  justify-self: start;
+}
+.assignment {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.8fr) minmax(240px, 1.2fr);
+  gap: 10px 14px;
+  align-items: end;
+  margin: 10px 0;
+}
+.assignment label,
+.forward label {
+  margin-top: 0;
+}
+.forward-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.forward-row select {
+  flex: 1 1 200px;
+  width: auto;
+  min-width: 0;
+}
+.private-thread-content > .forward {
+  margin-bottom: 12px;
+}
+.console-search {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.console-search input {
+  flex: 1 1 260px;
+}
+.console-search select {
+  flex: 0 1 240px;
+  width: auto;
+}
+@media (max-width: 760px) {
+  .assignment {
+    grid-template-columns: 1fr;
+  }
+  .console-search select {
+    flex: 1 1 100%;
+  }
+}

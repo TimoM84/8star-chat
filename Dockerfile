@@ -1,5 +1,5 @@
 FROM node:24-alpine
-LABEL org.opencontainers.image.title="8star Chat" org.opencontainers.image.version="0.8.0"
+LABEL org.opencontainers.image.title="8star Chat" org.opencontainers.image.version="1.0.0"
 WORKDIR /app
 ENV NODE_ENV=production PORT=3000 DATA_DIR=/data
 COPY package.json package-lock.json ./

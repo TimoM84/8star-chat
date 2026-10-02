@@ -26,6 +26,16 @@ Background for operators and developers. The [README](../README.md) covers insta
 - Requests that use a session must also send that session's CSRF token (`x-csrf-token`). No CORS access is granted.
 - Error messages are generic and do not reveal private data, session details or whether an account exists.
 
+## Roles and assignment
+
+- **Managers** — the platform admin and the event owner of this event — see and handle everything in the event, and forward (assign) questions and private conversations to moderators.
+- A **moderator** only sees and handles questions and private conversations that are assigned to their own user id: a question's `assignedTo`, or `privateThreads[participantId].assignedTo` for a conversation. Unassigned items and items assigned to another moderator are invisible: `GET /messages` filters them out, every action on them (publish, reject, withdraw, stage, pin, block, private reply, close/reopen) answers `404` as if they did not exist, and the CSV export, settings, team and blocked-user endpoints are managers-only (`403`).
+- **Live connection:** moderator streams carry no message content — only the event name with an empty payload — after which the console reloads what it may see. Public events (published messages, pins, settings) carry public data only.
+- Team items are visible to the whole team: speaker cues and notes, messages from the stage and announcements.
+- The **stage screen** (whole speaker queue) is for stage accounts, managers and holders of a secure stage link; moderator accounts are refused.
+- Assignments are only possible to active moderators of the event. Removing a moderator from the event, disabling the account or changing its role makes their items unassigned; on start-up, items assigned to accounts that are no longer active moderators are unassigned as well. Nothing is deleted.
+- A new attendee message in a conversation keeps the conversation's assignment.
+
 ## Sending messages: what an answer means
 
 Every message from an attendee carries a random `clientMessageId` chosen by the browser. The server answers:

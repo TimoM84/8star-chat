@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.0.0
+
+### Moderators: forward to one moderator
+
+- **Forward to moderator:** the event owner (and the platform admin) chooses a moderator under **Forward to moderator** and selects **Forward** — for a question in the inbox or archive, and now also for a private conversation. **Remove assignment** withdraws it; forwarding to someone else reassigns it. Cards show **Assigned to …** or **Not assigned**, and a filter shows the items of one moderator or the unassigned ones.
+- **A moderator only sees what is assigned to them.** Unassigned questions and conversations, and those of other moderators, are no longer visible to moderators — in the console, through the API (`404` as if they did not exist) and over the live connection. Before this release a moderator saw every unassigned question and every private conversation.
+- **Live connection without content:** moderator screens now receive only a "something changed" signal and reload what they may see. Before, every moderator screen received the full text of every new message, including private ones.
+- **Owner-only:** CSV export, event settings, the team list and blocked users are now limited to the event owner and the platform admin. Before, every moderator could export the whole chat (including private messages), change the chat mode, capacity and blocked words, and unblock attendees.
+- **Speaker screen:** for stage accounts, the event owner and holders of a secure stage link; moderator accounts are refused (the screen shows the whole speaker queue).
+- **Nothing gets stuck:** removing a moderator from the event, disabling the account or giving it another role makes its questions and conversations unassigned, so they can be forwarded again. Before, this only happened for questions and only on removal. On start-up, items still assigned to accounts that are no longer active moderators become unassigned too.
+- **Fixed:** a new message from an attendee reset the state of their private conversation; it now keeps its assignment.
+- The CSV export shows the assigned moderator's e-mail address (also for private conversations) instead of an internal id.
+
+### Upgrade notes
+
+- Moderators no longer see unassigned questions. In moderated events, the event owner forwards new questions to a moderator; until then they are only visible to the event owner and the platform admin.
+- Existing data is used as is; existing assignments stay.
+
 ## v0.8.0
 
 ### Search

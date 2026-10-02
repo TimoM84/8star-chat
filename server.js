@@ -637,6 +637,67 @@ function eventAuth(req, e, role = "moderator") {
     ? u
     : null;
 }
+// ---- Who may see and handle what ---------------------------------------------
+// Managers (the platform admin and the owner of this event) see and handle
+// everything. A moderator only sees and handles questions and private
+// conversations that are explicitly assigned to their own user id
+// (`assignedTo`); moderator rights alone never give access to anything that is
+// unassigned or assigned to someone else. Team items — speaker cues and notes,
+// messages from the stage, and announcements (which are public) — are visible
+// to the whole team.
+const threadOf = (m) => m.participantId || m.targetParticipantId || "";
+const threadAssignee = (e, participantId) =>
+  (participantId && e.privateThreads?.[participantId]?.assignedTo) || "";
+const TEAM_TYPES = new Set(["cue", "stage", "stage-reply", "announcement"]);
+function staffCanSee(u, e, m) {
+  if (!u || !m) return false;
+  if (canManageEvent(u, e)) return true;
+  if (m.type === "question") return Boolean(m.assignedTo) && m.assignedTo === u.id;
+  if (m.type === "private" || m.type === "private-reply") {
+    const assignee = threadAssignee(e, threadOf(m));
+    return Boolean(assignee) && assignee === u.id;
+  }
+  return TEAM_TYPES.has(m.type);
+}
+const canHandleThread = (u, e, participantId) =>
+  Boolean(u) &&
+  (canManageEvent(u, e) ||
+    (Boolean(threadAssignee(e, participantId)) && threadAssignee(e, participantId) === u.id));
+// Questions and conversations can only be assigned to an active moderator of
+// this event.
+const assignableModerator = (e, userId) =>
+  state.users.find(
+    (x) => x.id === userId && e.moderators.includes(x.id) && x.role === "moderator" && x.active !== false,
+  );
+// When a moderator is removed, disabled or gets another role, everything that
+// was assigned to them becomes unassigned again (managers can reassign it).
+function releaseAssignments(userId, events = state.events) {
+  let released = 0;
+  for (const e of events) {
+    let n = 0;
+    for (const m of eventMessages(e.slug))
+      if (m.assignedTo === userId) {
+        m.assignedTo = "";
+        m.assignedAt = "";
+        n++;
+      }
+    for (const t of Object.values(e.privateThreads || {}))
+      if (t && t.assignedTo === userId) {
+        t.assignedTo = "";
+        t.assignedAt = "";
+        n++;
+      }
+    if (n) broadcast(e.slug, "assignment", {}, "moderator");
+    released += n;
+  }
+  return released;
+}
+// The stage screen is for stage accounts, managers and holders of a stage link;
+// a moderator account does not open it (it shows the whole speaker queue).
+function stageUser(req, e) {
+  const u = eventAuth(req, e, "stage");
+  return u && (u.role === "stage" || canManageEvent(u, e)) ? u : null;
+}
 
 // ---------------------------------------------------------------------------
 // Attendee (guest) sessions
@@ -838,6 +899,11 @@ function writeSlice(r) {
   });
 }
 const AUDIENCES = { all: ["guest", "moderator", "stage"], moderator: ["moderator"], stage: ["stage"] };
+// Moderator screens receive only a signal ("something changed") and then
+// reload what they are allowed to see from GET /messages. Message content
+// never travels over a moderator connection, so a moderator cannot read items
+// assigned to someone else from the stream. Public events carry public data.
+const PUBLIC_KINDS = new Set(["public", "remove", "pins", "settings"]);
 // Returns false only when the attendee queue is full (the event was not sent
 // to attendees). Staff screens are few and are written to directly.
 function broadcast(slug, kind, data, audience = "all") {
@@ -848,6 +914,9 @@ function broadcast(slug, kind, data, audience = "all") {
   for (const role of AUDIENCES[audience] || []) {
     if (role === "guest") {
       if (r.guest.size) queued = deliverToGuests(r, p);
+    } else if (role === "moderator") {
+      const staffPayload = PUBLIC_KINDS.has(kind) ? p : ssePayload(kind, {});
+      for (const c of r.moderator) sseWrite(c, staffPayload);
     } else for (const c of r[role]) sseWrite(c, p);
   }
   return queued;
@@ -987,8 +1056,7 @@ const stageSnapshot = (e) => {
 };
 const stageTokenValid = (e, access) =>
   Boolean(e.stageToken && secretEqual(access, e.stageToken) && Date.now() < e.stageAccessExpires);
-const stageAuthorized = (req, e, access = "") =>
-  Boolean(eventAuth(req, e, "stage") || stageTokenValid(e, access));
+const stageAuthorized = (req, e, access = "") => Boolean(stageUser(req, e) || stageTokenValid(e, access));
 const sanitize = (s, max = MAX_MESSAGE) =>
   String(s || "")
     .replace(/[<>\u0000-\u001f\u007f]/g, " ")
@@ -1450,8 +1518,15 @@ const server = http.createServer(async (req, res) => {
         } else {
           u = auth(req, "stage");
           const stageView = url.searchParams.get("screen") === "stage";
+          if (
+            stageView &&
+            u &&
+            !stageUser(req, e) &&
+            !stageTokenValid(e, url.searchParams.get("access") || "")
+          )
+            return send(res, 403, { error: "Stage access required." });
           role =
-            stageView && u && eventAuth(req, e, "stage")
+            stageView && u && stageUser(req, e)
               ? "stage"
               : u && u.role !== "stage" && eventAuth(req, e)
                 ? "moderator"
@@ -1642,7 +1717,11 @@ const server = http.createServer(async (req, res) => {
         metrics.inc("post.201");
         if (kind === "private") {
           e.privateThreads ||= {};
-          e.privateThreads[m.participantId] = { status: "open", updatedAt: m.createdAt };
+          e.privateThreads[m.participantId] = {
+            ...(e.privateThreads[m.participantId] || {}),
+            status: "open",
+            updatedAt: m.createdAt,
+          };
           broadcast(
             slug,
             "private-thread-status",
@@ -1721,17 +1800,20 @@ const server = http.createServer(async (req, res) => {
       const mod = eventAuth(req, e);
       if (action === "messages" && req.method === "GET") {
         if (!mod) return send(res, 401, { error: "Access denied" });
+        const manager = canManageEvent(mod, e);
         const messages = eventMessages(slug)
-          .filter(
-            (m) => mod.role === "owner" || canManageEvent(mod, e) || !m.assignedTo || m.assignedTo === mod.id,
-          )
+          .filter((m) => staffCanSee(mod, e, m))
           .map((m) => {
             const { ipHash, clientKey, ...visible } = m;
             return { ...visible, ipAvailable: Boolean(ipHash) && TRUST_PROXY };
           });
+        const threads = Object.fromEntries(
+          Object.entries(e.privateThreads || {}).filter(([pid]) => manager || canHandleThread(mod, e, pid)),
+        );
         return send(res, 200, {
           messages,
-          privateThreads: e.privateThreads || {},
+          manager,
+          privateThreads: threads,
           pins: pinnedForEvent(e),
           trustProxy: TRUST_PROXY,
         });
@@ -1758,6 +1840,8 @@ const server = http.createServer(async (req, res) => {
       }
       if (action === "settings" && req.method === "PATCH") {
         if (!mod) return send(res, 401, { error: "Access denied" });
+        if (!canManageEvent(mod, e))
+          return send(res, 403, { error: "Only the event owner can change the settings." });
         const b = await body(req);
         if (b.title) e.title = sanitize(b.title, 100);
         if (["open", "moderated", "readonly"].includes(b.mode)) e.mode = b.mode;
@@ -1788,19 +1872,12 @@ const server = http.createServer(async (req, res) => {
         const b = await body(req),
           m = findMessage(assign[1], slug);
         if (!m) return send(res, 404, { error: "Message not found." });
+        if (m.type !== "question")
+          return send(res, 400, { error: "Assign private messages through their conversation." });
         const assignedTo = String(b.assignedTo || "");
-        if (
-          assignedTo &&
-          !state.users.some(
-            (x) =>
-              x.id === assignedTo &&
-              e.moderators.includes(x.id) &&
-              x.role === "moderator" &&
-              x.active !== false,
-          )
-        )
+        if (assignedTo && !assignableModerator(e, assignedTo))
           return send(res, 400, { error: "Choose an active moderator for this event." });
-        m.topic = sanitize(b.topic, 60);
+        if (b.topic !== undefined) m.topic = sanitize(b.topic, 60);
         m.assignedTo = assignedTo;
         m.assignedAt = assignedTo ? new Date().toISOString() : "";
         save();
@@ -1810,7 +1887,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (action.startsWith("conversations/") && req.method === "POST") {
         if (!mod) return send(res, 401, { error: "Access denied" });
-        const conv = action.match(/^conversations\/([^/]+)\/(close|reopen)$/);
+        const conv = action.match(/^conversations\/([^/]+)\/(close|reopen|assign)$/);
         if (!conv) return send(res, 404, { error: "Not found" });
         const participantId = decodeURIComponent(conv[1]),
           threadMessages = eventMessages(slug).filter(
@@ -1818,7 +1895,28 @@ const server = http.createServer(async (req, res) => {
               (m.participantId === participantId || m.targetParticipantId === participantId) &&
               ["private", "private-reply"].includes(m.type),
           );
-        if (!threadMessages.length) return send(res, 404, { error: "Private conversation not found." });
+        // Not assigned to this moderator: answer as if it does not exist.
+        if (!threadMessages.length || !canHandleThread(mod, e, participantId))
+          return send(res, 404, { error: "Private conversation not found." });
+        if (conv[2] === "assign") {
+          if (!canManageEvent(mod, e))
+            return send(res, 403, { error: "Only the event owner can assign questions." });
+          const b = await body(req),
+            assignedTo = String(b.assignedTo || "");
+          if (assignedTo && !assignableModerator(e, assignedTo))
+            return send(res, 400, { error: "Choose an active moderator for this event." });
+          e.privateThreads ||= {};
+          e.privateThreads[participantId] = {
+            status: "open",
+            updatedAt: threadMessages.at(-1).createdAt,
+            ...(e.privateThreads[participantId] || {}),
+            assignedTo,
+            assignedAt: assignedTo ? new Date().toISOString() : "",
+          };
+          save();
+          broadcast(slug, "assignment", {}, "moderator");
+          return send(res, 200, { participantId, ...e.privateThreads[participantId] });
+        }
         const status = conv[2] === "close" ? "closed" : "open",
           updatedAt = new Date().toISOString();
         e.privateThreads ||= {};
@@ -1837,7 +1935,8 @@ const server = http.createServer(async (req, res) => {
       if (action === "pins" && req.method === "POST") {
         if (!mod) return send(res, 401, { error: "Access denied" });
         const b = await body(req),
-          m = findMessage(b.messageId, slug);
+          found = findMessage(b.messageId, slug),
+          m = staffCanSee(mod, e, found) ? found : null;
         if (!m || m.status !== "published" || m.visibility !== "public" || m.type !== "question")
           return send(res, 400, { error: "Only published public questions can be pinned." });
         e.pinnedMessages ||= [];
@@ -1894,6 +1993,7 @@ const server = http.createServer(async (req, res) => {
         const messageId = decodeURIComponent(unpin[1]),
           found = findMessage(messageId, slug),
           announcement = found?.type === "announcement" ? found : null;
+        if (found && !staffCanSee(mod, e, found)) return send(res, 404, { error: "Message not found." });
         e.pinnedMessages = (e.pinnedMessages || []).filter((x) => x.messageId !== messageId);
         if (announcement) {
           announcement.status = "withdrawn";
@@ -1907,6 +2007,8 @@ const server = http.createServer(async (req, res) => {
       }
       if (action === "bans" && req.method === "GET") {
         if (!mod) return send(res, 401, { error: "Access denied" });
+        if (!canManageEvent(mod, e))
+          return send(res, 403, { error: "Only the event owner can manage blocked users." });
         const rowsForEvent = eventMessages(slug);
         const bans = state.bans
           .filter((x) => x.slug === slug)
@@ -1931,6 +2033,8 @@ const server = http.createServer(async (req, res) => {
       const unban = action.match(/^bans\/([^/]+)$/);
       if (unban && req.method === "DELETE") {
         if (!mod) return send(res, 401, { error: "Access denied" });
+        if (!canManageEvent(mod, e))
+          return send(res, 403, { error: "Only the event owner can manage blocked users." });
         const key = decodeURIComponent(unban[1]),
           ban = state.bans.find((x) => x.slug === slug && (x.id === key || x.participantId === key));
         if (!ban) return send(res, 404, { error: "Blocked user not found." });
@@ -1970,7 +2074,7 @@ const server = http.createServer(async (req, res) => {
       if (op && req.method === "POST") {
         if (!mod) return send(res, 401, { error: "Access denied" });
         const m = findMessage(op[1], slug);
-        if (!m) return send(res, 404, { error: "Message not found" });
+        if (!m || !staffCanSee(mod, e, m)) return send(res, 404, { error: "Message not found" });
         const act = op[2];
         // Private conversations can never be published or sent to the stage.
         if (
@@ -2044,6 +2148,9 @@ const server = http.createServer(async (req, res) => {
             : findMessage(b.messageId, slug);
         if (!m || !m.participantId || !["private", "question"].includes(m.type) || !text)
           return send(res, 400, { error: "This private conversation cannot be answered." });
+        // A moderator answers only conversations (or questions) assigned to them.
+        if (!(m.type === "private" ? canHandleThread(mod, e, m.participantId) : staffCanSee(mod, e, m)))
+          return send(res, 404, { error: "Private conversation not found." });
         const now = new Date().toISOString(),
           reply = {
             id: id(),
@@ -2079,7 +2186,8 @@ const server = http.createServer(async (req, res) => {
       if (action === "ban" && req.method === "POST") {
         if (!mod) return send(res, 401, { error: "Access denied" });
         const b = await body(req),
-          m = findMessage(b.messageId, slug);
+          found = findMessage(b.messageId, slug),
+          m = staffCanSee(mod, e, found) ? found : null;
         if (!m?.participantId) return send(res, 400, { error: "Participant not found" });
         if (!participantIsBanned(slug, m.participantId))
           state.bans.push({
@@ -2111,7 +2219,8 @@ const server = http.createServer(async (req, res) => {
               "Set TRUST_PROXY=true to enable IP blocking. Use it only behind a reverse proxy that sets X-Forwarded-For.",
           });
         const b = await body(req),
-          m = findMessage(b.messageId, slug);
+          found = findMessage(b.messageId, slug),
+          m = staffCanSee(mod, e, found) ? found : null;
         if (!m) return send(res, 404, { error: "Message not found." });
         if (!m.ipHash)
           return send(res, 400, {
@@ -2195,7 +2304,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (action === "stage-reply" && req.method === "POST") {
         const b = await body(req),
-          u = eventAuth(req, e, "stage");
+          u = stageUser(req, e);
         if (!u && !stageTokenValid(e, b.access)) return send(res, 401, { error: "Access denied" });
         const text = sanitize(b.text);
         if (!text) return send(res, 400, { error: "Message is empty" });
@@ -2215,6 +2324,8 @@ const server = http.createServer(async (req, res) => {
       }
       if (action === "moderators" && req.method === "GET") {
         if (!mod) return send(res, 401, { error: "Access denied" });
+        if (!canManageEvent(mod, e))
+          return send(res, 403, { error: "Only the event owner can manage the team." });
         return send(res, 200, {
           users: state.users
             .filter(
@@ -2339,10 +2450,12 @@ const server = http.createServer(async (req, res) => {
             user.role = b.role;
             delete user.ownerEventId;
           }
+          if (user.role !== "moderator") releaseAssignments(user.id);
           revokeUserAccess(user.id);
         }
         if (typeof b.active === "boolean" && user.active !== b.active) {
           user.active = b.active;
+          if (!user.active) releaseAssignments(user.id);
           revokeUserAccess(user.id);
         }
         if (b.topics !== undefined) {
@@ -2370,13 +2483,16 @@ const server = http.createServer(async (req, res) => {
         e.moderators = e.moderators.filter((x) => x !== b.userId);
         revokeUserStreams(b.userId, slug);
         if (e.moderatorTopics) delete e.moderatorTopics[b.userId];
-        for (const m of eventMessages(slug)) if (m.assignedTo === b.userId) m.assignedTo = "";
+        releaseAssignments(b.userId, [e]);
         save();
         return send(res, 200, { ok: true });
       }
       if (action === "export" && req.method === "GET") {
         if (!mod) return send(res, 401, { error: "Access denied" });
-        const rows = eventMessages(slug);
+        if (!canManageEvent(mod, e))
+          return send(res, 403, { error: "Only the event owner can export the chat." });
+        const rows = eventMessages(slug),
+          emailOf = (userId) => state.users.find((x) => x.id === userId)?.email || "";
         const csv = [
           "time,type,status,stage_status,topic,assigned_to,name,language,message",
           ...rows.map((m) =>
@@ -2386,7 +2502,11 @@ const server = http.createServer(async (req, res) => {
               m.status,
               m.stageState || "",
               m.topic || "",
-              m.assignedTo || "",
+              emailOf(
+                m.type === "private" || m.type === "private-reply"
+                  ? threadAssignee(e, threadOf(m))
+                  : m.assignedTo,
+              ),
               m.author,
               m.language || "",
               m.text,
@@ -2449,6 +2569,30 @@ const server = http.createServer(async (req, res) => {
     else res.end();
   }
 });
+// Data from earlier versions: anything assigned to someone who is no longer an
+// active moderator of that event becomes unassigned, so it is never stuck.
+{
+  let cleared = 0;
+  for (const e of state.events) {
+    const valid = (userId) => Boolean(assignableModerator(e, userId));
+    for (const m of eventMessages(e.slug))
+      if (m.assignedTo && !valid(m.assignedTo)) {
+        m.assignedTo = "";
+        m.assignedAt = "";
+        cleared++;
+      }
+    for (const t of Object.values(e.privateThreads || {}))
+      if (t?.assignedTo && !valid(t.assignedTo)) {
+        t.assignedTo = "";
+        t.assignedAt = "";
+        cleared++;
+      }
+  }
+  if (cleared) {
+    console.log("Unassigned " + cleared + " item(s) of moderators who are no longer active.");
+    save();
+  }
+}
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
 server.requestTimeout = 0; // SSE connections are long-lived.

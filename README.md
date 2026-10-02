@@ -13,7 +13,8 @@ Built with Node.js. No external database: everything is stored in one Docker vol
 - Search everywhere: attendees search all published messages from the live chat; moderators search every tab of the console; speakers filter their queue
 - Works on phones, tablets and desktops; the live chat keeps your place while you scroll back
 - Private conversation with the moderators, protected by a personal PIN
-- Moderator console with inbox, archive, private messages and topic assignment
+- Moderator console with inbox, archive, private messages and topics
+- Forward a question or private conversation to one specific moderator; a moderator only sees what is assigned to them
 - Pin announcements and attendee questions above the chat (up to five)
 - iPad-friendly speaker queue and a temporary speaker link with QR code
 - Blocked words, blocking by session or IP address, and an unblock list
@@ -35,7 +36,7 @@ Built with Node.js. No external database: everything is stored in one Docker vol
 
 ### Moderators
 
-![Moderation queue with topic assignment](docs/screenshots/moderator-inbox.jpg)
+![Moderation queue: forward a question to a specific moderator](docs/screenshots/moderator-inbox.jpg)
 
 | Private messages                                                                          | Event settings                                                                                         |
 | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
@@ -96,7 +97,7 @@ docker compose up -d
 
 Open `http://YOUR-SERVER-IP:9876` and sign in with `ADMIN_EMAIL` and `ADMIN_PASSWORD` (at least 12 characters; only used for the first start).
 
-`#main` always builds the newest version. To stay on a fixed release, use a tag instead, for example `#v0.8.0`.
+`#main` always builds the newest version. To stay on a fixed release, use a tag instead, for example `#v1.0.0`.
 
 ## Dockhand and Portainer
 
@@ -149,13 +150,27 @@ Run the chat behind a reverse proxy with HTTPS (for example Nginx Proxy Manager)
 
 1. Sign in with the platform admin account.
 2. Create an event and choose **Moderated**, **Read-only** or **Open**.
-3. Add moderators and the topics each of them handles. Create an event owner if someone needs to manage this event without access to the platform.
-4. Assign questions by topic in the inbox. Send a question from the inbox or archive to **Stage / cues**; the speaker selects it on an iPad and marks it read.
+3. Add moderators in **Team**, with the topics each of them handles. Create an event owner if someone needs to manage this event without access to the platform.
+4. In the inbox, choose a moderator under **Forward to moderator** and select **Forward**. That moderator now sees the question; other moderators do not. Do the same for private conversations in **Private messages**. Send a question from the inbox or archive to **Stage / cues**; the speaker selects it on an iPad and marks it read.
 5. Answer attendees in **Private messages** and close conversations when resolved. New attendee messages reopen a closed conversation.
 6. Pin announcements from **Published / archive**. Use **Blocked users** to restore access when needed.
 7. Add blocked words and enable or disable private messages in **Settings**.
 8. Export the full message history as CSV from **Published / archive** or **Settings**.
 9. Create a temporary speaker link and QR code in **Stage / cues**.
+
+## Roles and rights
+
+|                                                             | Platform admin | Event owner | Moderator | Stage account |
+| ----------------------------------------------------------- | -------------- | ----------- | --------- | ------------- |
+| Create events and event owners                              | ✓              |             |           |               |
+| See all questions and private conversations of the event    | ✓              | ✓           |           |               |
+| Forward, reassign or withdraw an assignment                 | ✓              | ✓           |           |               |
+| See and handle questions and conversations assigned to them | ✓              | ✓           | ✓         |               |
+| Team, blocked users, settings, CSV export, speaker link     | ✓              | ✓           |           |               |
+| Announcements, speaker notes, messages from the stage       | ✓              | ✓           | ✓         |               |
+| Speaker screen                                              | ✓              | ✓           |           | ✓             |
+
+A moderator only sees questions and private conversations that are explicitly assigned to their own account. Moderator rights alone never give access to anything that is unassigned or assigned to another moderator — not in the console, not through the API and not over the live connection (moderator screens only receive a "something changed" signal and then load what they may see). When a moderator is removed from the event, disabled or given another role, everything assigned to them becomes unassigned again, so the event owner can forward it to someone else.
 
 ## Pages
 
