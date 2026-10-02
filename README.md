@@ -61,25 +61,13 @@ A message is **never shown before it is stored**, and it is stored before `201` 
 
 ## Install or update on the server
 
-The Compose file uses the image `8star-chat:0.7.0`, which is built on the Docker host from this source (`pull_policy: never`). Build it on the server, then update the existing stack:
+`compose.yaml` builds the image from the folder it is in and stores data in the volume `8star-chat_8star_chat_data`. Keep your environment values (`ADMIN_PASSWORD`, `ADMIN_EMAIL`, `FRAME_ANCESTORS`, `ROOM_PUBLISH_PER_SECOND`, …) in the stack's environment, not in Git.
 
-```sh
-python3 -m zipfile -e 8star-chat-v0.7.0.zip .
-docker build -t 8star-chat:0.7.0 8star-chat-v0.7.0
-```
+**Dockhand, stack "From Git":** repository `https://github.com/TimoM84/8star-chat.git`, the release tag (for example `v0.7.1`) as reference, compose file `compose.yaml`, and the environment values as stack variables (mark `ADMIN_PASSWORD` as secret). To update, change the reference to the new tag and redeploy.
 
-Replace the stack's Compose file with `compose.yaml` from this release and redeploy. Keep the stack (project) name, the service name `8star-chat` and the volume name `8star_chat_data` unchanged: Docker Compose prefixes the volume with the project name, so a new name would start with an empty volume. Keep the existing environment values (`ADMIN_PASSWORD`, `ADMIN_EMAIL`, `ROOM_PUBLISH_PER_SECOND`, …).
+**Without Git:** unpack the release and run `docker compose up -d --build` in its folder.
 
-Back up the data volume before every update. A backup taken while the container is stopped is guaranteed to be consistent.
-
-**Building from Git instead:** after this release is pushed with the tag `v0.7.0`, Compose can build the image itself. Replace `image:`/`pull_policy:` with:
-
-```yaml
-build:
-  context: https://github.com/TimoM84/8star-chat.git#v0.7.0
-  dockerfile: Dockerfile
-image: 8star-chat:0.7.0
-```
+Back up the data volume before every update; a backup taken while the container is stopped is guaranteed to be consistent. When removing or replacing a stack, never choose to remove its volumes.
 
 The app listens on port `9876` of the Docker host. Configure the reverse proxy for long-lived Server-Sent Events connections without buffering, and let it pass `Host` (or `X-Forwarded-Host`), `X-Forwarded-Proto` and `X-Forwarded-For`. Every connected attendee uses up to four proxy connections over HTTP/1.1 (stream and request connection on the browser side, and their upstream connections); size the proxy's `worker_connections` × `worker_processes` accordingly (see _Capacity and limitations_).
 
@@ -113,7 +101,7 @@ The app listens on port `9876` of the Docker host. Configure the reverse proxy f
 | `LISTEN_BACKLOG`              | `4096`                | Accept queue of the listening socket (capped by the kernel's `net.core.somaxconn`).                                                                                                                   |
 | `METRICS_LOG_SECONDS`         | `0` (`60` in Compose) | Write one JSON metrics line to the container log every N seconds (counts and timings only; no message text, names, cookies or tokens). `0` disables it.                                               |
 
-The named volume `8star_chat_data` holds `state.json` (events, accounts, messages), `messages-N.journal` (messages confirmed since the last `state.json` snapshot; replayed at start-up and removed after the next snapshot), `guest-sessions.json` (hashed attendee sessions and PIN hashes), `ip-block-key` (key for keyed IP hashes; raw IP addresses are not stored) and `session-key` (key for CSRF tokens). Keep a separate backup. IP blocking applies to everyone sharing that public IP, such as people on the same venue Wi-Fi. The CSV export is available in the moderator console under **Published / archive** and **Settings**. Export it before removing the stack or its volume.
+The volume `8star-chat_8star_chat_data` holds `state.json` (events, accounts, messages), `messages-N.journal` (messages confirmed since the last `state.json` snapshot; replayed at start-up and removed after the next snapshot), `guest-sessions.json` (hashed attendee sessions and PIN hashes), `ip-block-key` (key for keyed IP hashes; raw IP addresses are not stored) and `session-key` (key for CSRF tokens). Keep a separate backup. IP blocking applies to everyone sharing that public IP, such as people on the same venue Wi-Fi. The CSV export is available in the moderator console under **Published / archive** and **Settings**. Export it before removing the stack or its volume.
 
 ## Routes
 

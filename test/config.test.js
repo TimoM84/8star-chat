@@ -39,7 +39,12 @@ test("Compose only sets variables the server actually reads", () => {
 test("Compose keeps the existing data volume and does not rename the project", () => {
   assert.match(compose, /- 8star_chat_data:\/data/);
   assert.match(compose, /^volumes:\n\s+8star_chat_data:/m);
+  // Fixed volume name: the stack/project name does not decide which volume is used.
+  assert.match(compose, /^volumes:\n\s+8star_chat_data:\n(\s+#.*\n)*\s+name: 8star-chat_8star_chat_data$/m);
+  assert.doesNotMatch(compose, /external:\s*true/);
   assert.doesNotMatch(compose, /^name:/m, "a top-level name would create a new, empty volume");
+  // Builds from the checkout (Dockhand Git stack / docker compose up --build).
+  assert.match(compose, /build:\n\s+context: \.\n\s+dockerfile: Dockerfile/);
   assert.match(compose, /"9876:3000"/);
   assert.match(compose, new RegExp("image: 8star-chat:" + pkg.version.replaceAll(".", "\\.")));
 });

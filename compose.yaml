@@ -1,13 +1,16 @@
-# 8star Chat v0.7.0 — Compose stack (Dockhand / docker compose) for Helios.
+# 8star Chat v0.7.1 — Compose stack for Dockhand ("From Git") or docker compose.
 #
-# The image is built on the Docker host from the release source:
-#   docker build -t 8star-chat:0.7.0 <release directory>
-# Keep the project/stack name, the service name and the volume name unchanged
-# so the existing data volume (8star_chat_data) is reused.
+# The image is built from the repository checkout this file is in, so a
+# Dockhand Git stack (repository + tag + compose.yaml) builds and deploys in
+# one step. Without Git: run `docker compose up -d --build` in the release folder.
+# The data volume has a fixed name, so the existing data is used whatever the
+# stack/project is called. Never remove this volume when removing a stack.
 services:
   8star-chat:
-    image: 8star-chat:0.7.0
-    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: 8star-chat:0.7.1
     restart: unless-stopped
     ports:
       - "9876:3000"
@@ -60,3 +63,5 @@ services:
 
 volumes:
   8star_chat_data:
+    # Existing production volume (created by the stack "8star-chat").
+    name: 8star-chat_8star_chat_data

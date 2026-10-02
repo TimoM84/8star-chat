@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.1
+
+### Deployment
+
+- `compose.yaml` builds the image from the repository checkout (`build: .`), so a Dockhand stack "From Git" (repository, tag, `compose.yaml`) builds and deploys in one step; `docker compose up -d --build` does the same for a downloaded release.
+- The data volume has the fixed name `8star-chat_8star_chat_data` (the existing production volume), so the data no longer depends on the stack/project name.
+- No changes to the application code since v0.7.0.
+
 ## v0.7.0
 
 ### Behaviour under peak load

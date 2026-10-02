@@ -1,6 +1,6 @@
 {
   "name": "8star-chat",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "private": true,
   "description": "White-label live event chat with moderation and stage monitor",
   "scripts": {
