@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Test tools
+
+- `scripts/loadtest.js`: request connections use a 45 s TCP keep-alive (like Chrome) instead of Node's 1 s. With 8000 attendees on one machine, all streams went quiet at the same moment between two heartbeats, every socket then sent a keep-alive probe each second, the kernel queue overflowed and up to 25% of the test streams were aborted by the kernel (`TCPAbortOnTimeout`). The server and the image are unchanged.
+
 ## v0.7.1
 
 ### Deployment

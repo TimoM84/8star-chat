@@ -40,6 +40,8 @@ const https = require("node:https");
 const crypto = require("node:crypto");
 const { monitorEventLoopDelay, performance } = require("node:perf_hooks");
 
+const TCP_KEEPALIVE_MS = 45000;
+
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
@@ -362,7 +364,16 @@ function runWorker() {
       o = msg.o;
       lib = o.url.startsWith("https:") ? https : http;
       origin = new URL(o.url).origin;
-      agent = new lib.Agent({ keepAlive: true, maxSockets: Math.max(16, msg.joinConcurrency) });
+      // TCP keep-alive probes like a browser (Chrome: 45 s idle). Node's default
+      // for keep-alive agents is 1 s: when thousands of streams go quiet at the
+      // same moment (between two heartbeats) every socket sends a probe each
+      // second, the loopback/NIC queue overflows and the kernel aborts
+      // connections (TCPAbortOnTimeout) — a test artefact, not a server fault.
+      agent = new lib.Agent({
+        keepAlive: true,
+        keepAliveMsecs: TCP_KEEPALIVE_MS,
+        maxSockets: Math.max(16, msg.joinConcurrency),
+      });
       freshAgent = new lib.Agent({ keepAlive: false, maxSockets: Infinity });
       sseAgent = new lib.Agent({ keepAlive: false, maxSockets: Infinity, maxCachedSessions: 0 });
       attendees = msg.indexes.map((index) => ({
@@ -371,7 +382,12 @@ function runWorker() {
         // stream; the second TLS connection resumes the session of the first.
         agent:
           o.connections === "browser"
-            ? new lib.Agent({ keepAlive: true, maxSockets: 2, maxCachedSessions: o.tlsResume ? 1 : 0 })
+            ? new lib.Agent({
+                keepAlive: true,
+                keepAliveMsecs: TCP_KEEPALIVE_MS,
+                maxSockets: 2,
+                maxCachedSessions: o.tlsResume ? 1 : 0,
+              })
             : null,
       }));
       process.send({ cmd: "ok" });
