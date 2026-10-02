@@ -2,11 +2,14 @@
   const { languages, createTranslator } = window.chatI18nCore;
   // English is the default interface language; a language chosen with the
   // picker is remembered in this browser.
+  // An embedding page can choose the language with ?lang=nl (remembered).
   let current = "en";
+  const requested = new URLSearchParams(location.search).get("lang");
   try {
+    if (languages.includes(requested)) localStorage.setItem("8star-language", requested);
     current = localStorage.getItem("8star-language") || "en";
   } catch {
-    current = "en";
+    current = languages.includes(requested) ? requested : "en";
   }
   if (!languages.includes(current)) current = "en";
   let translateCurrent = createTranslator(current);

@@ -9,7 +9,9 @@ Built with Node.js. No external database: everything is stored in one Docker vol
 ## Features
 
 - Three chat modes per event: **Moderated** (approve first), **Open** (messages appear immediately) or **Read-only**
-- Embeds as an iframe on any livestream page; white-label per event (name and logo)
+- Embeds as an iframe on any livestream page, with language and theme per page; white-label per event (name and logo)
+- Search everywhere: attendees search all published messages from the live chat; moderators search every tab of the console; speakers filter their queue
+- Works on phones, tablets and desktops; the live chat keeps your place while you scroll back
 - Private conversation with the moderators, protected by a personal PIN
 - Moderator console with inbox, archive, private messages and topic assignment
 - Pin announcements and attendee questions above the chat (up to five)
@@ -94,7 +96,7 @@ docker compose up -d
 
 Open `http://YOUR-SERVER-IP:9876` and sign in with `ADMIN_EMAIL` and `ADMIN_PASSWORD` (at least 12 characters; only used for the first start).
 
-`#main` always builds the newest version. To stay on a fixed release, use a tag instead, for example `#v0.7.1`.
+`#main` always builds the newest version. To stay on a fixed release, use a tag instead, for example `#v0.8.0`.
 
 ## Dockhand and Portainer
 
@@ -125,6 +127,15 @@ Copy the embed code from the event list or from **Settings** in the moderator co
 ```
 
 Set `FRAME_ANCESTORS` to the address of the livestream page (for example `https://live.example.com`) to allow only that site to embed the chat.
+
+Optional parameters on the chat address set the interface language and theme for that page; attendees can still change both themselves:
+
+| Parameter | Values                                                 | Example                    |
+| --------- | ------------------------------------------------------ | -------------------------- |
+| `lang`    | `en`, `nl`, `de`, `fr`                                 | `/e/your-event?lang=nl`    |
+| `theme`   | `light`, `dark`, `auto` (follows the device's setting) | `/e/your-event?theme=dark` |
+
+Everything works inside the iframe, including search, the private conversation and its PIN. The chat is designed to stay usable from about 320 × 420 pixels. Attendee sessions use a partitioned cookie (CHIPS), so they keep working when browsers block third-party cookies. When a browser blocks all cookies of the embedded chat (for example Safari with strict settings), the session is kept per browser tab instead; the attendee then joins again in a new tab.
 
 ## Behind a reverse proxy
 
@@ -205,6 +216,7 @@ With `#main` in the Compose file, redeploy the stack (or run `docker compose up 
 - Attendee sessions are created by the server and kept in an `HttpOnly` cookie; only a hash of the session secret is stored.
 - Private conversations need a personal PIN or passphrase, with lock-outs after wrong attempts and an automatic lock after 15 minutes without activity.
 - Public pages and streams never contain private messages, attendee ids or IP hashes. Staff e-mail addresses are never shown to attendees.
+- Search in the public chat only returns published public messages (what every attendee can already see), needs an attendee session and is rate limited.
 - State-changing requests are checked for origin and CSRF token; staff sign-in is rate limited.
 - The container runs as a non-root user with a read-only file system, no capabilities and `no-new-privileges`.
 

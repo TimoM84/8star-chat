@@ -53,6 +53,7 @@ const IGNORE_TEXT = new Set([
   "Français",
   "https://client.example.com/logo.png",
   "Delta works, Infrastructure",
+  "Escape",
 ]);
 
 function checkRows() {

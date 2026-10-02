@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased
+## v0.8.0
+
+### Search
+
+- **Live chat:** a small magnifying glass next to **To moderator** searches all published messages of the event, also older ones that are no longer on screen (`GET /api/events/<slug>/search?q=…`). Only published public messages are searched — never private, pending, rejected or withdrawn ones. Case- and accent-insensitive ("cafe" finds "Café"), every word must match, newest first, at most 50 results. Needs an attendee session, one search per session per 0.7 s, refused with `503` while the server is overloaded so live delivery always comes first.
+- **Moderator console:** one search field for every tab (inbox, private messages, archive and announcements, stage queue and messages from stage, team, blocked users). Tabs show the number of matches; matches are highlighted. The separate search field in **Private messages** is replaced by it.
+- **Speaker page:** filter for the question queue.
+
+### Live chat
+
+- Keeps your place: new messages only scroll the chat when you are at the bottom; otherwise a **New messages** button shows how many arrived. Nothing above the message you are reading is removed while you read back.
+- At most 300 messages stay on the page (older ones remain findable with search), so long, busy events stay fast on phones.
+- Pinned messages take at most about a third of the chat and scroll when there are many.
+- Usable in small embeds (from about 320 × 420 pixels); while searching, the language/identity line makes room for the results.
+- Embed parameters `?lang=en|nl|de|fr` and `?theme=light|dark|auto`.
+
+### Phones and tablets
+
+- Touch screens: buttons and links of at least 40–44 px, larger checkboxes, and 16 px text in fields so iPhones no longer zoom in when a field is focused.
+- Moderator console: tabs become a swipeable strip on phones and stay at the top while scrolling, together with the search field; lists grow with the page instead of scrolling inside it, and long lists load 50 at a time (**Show more**).
+- Speaker page on an iPad in portrait: question cards no longer get squeezed next to their button; the header keeps the title readable.
+
+### Tested
+
+- The chat embedded in a page on another site over HTTPS, with third-party cookies allowed, with every cookie of the chat blocked, and without cookies over plain HTTP: join, live messages, search, private conversation with PIN, moderators receiving it, and staying signed in after reloading the page.
 
 ### Documentation
 

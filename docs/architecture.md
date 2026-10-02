@@ -13,6 +13,7 @@ Background for operators and developers. The [README](../README.md) covers insta
 - Wrong PINs: after 5 consecutive failures the session waits 15 minutes (`PIN_LOCK_SECONDS`); after 20 failures in total the private conversation of that session is locked for good and the attendee has to start a new chat session.
 - **Not you? Leave chat** ends the session on the server, clears the cookie and closes its connections. Joining again in the same browser also ends the previous session.
 - Public chat, public SSE streams and public API answers only contain public messages, without attendee ids or IP hashes. Private messages are delivered only on a separate private stream that needs an unlocked PIN session. Private messages can never be published or sent to the stage.
+- Search in the public chat (`GET /api/events/<slug>/search?q=…`) only returns published public messages — the same messages every attendee already receives — with the same fields (author, text, time). It needs an attendee session, allows one search per session per 0.7 s and is refused with `503` while the server is overloaded. Private, pending, rejected and withdrawn messages are never searched.
 - SSE connections for attendees use single-use tickets that expire after 30 seconds, so no reusable secret appears in URLs or proxy logs.
 
 **Staff**

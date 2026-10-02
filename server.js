@@ -1025,7 +1025,47 @@ async function body(req) {
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
 }
 const userRate = new Map(),
-  roomRate = new Map();
+  roomRate = new Map(),
+  searchRate = new Map();
+// ---- Search in the public chat ---------------------------------------------
+// Case- and accent-insensitive: "Cafe" finds "Café". Every word of the query
+// must occur in the author or the text. The folded text is cached per message
+// object (texts never change), so a search is a plain scan with `includes`.
+const fold = (s) =>
+  String(s ?? "")
+    .normalize("NFD")
+    .replace(/\p{M}+/gu, "")
+    .toLowerCase();
+const searchTerms = (q) => [...new Set(fold(q).split(/\s+/).filter(Boolean))].slice(0, 8);
+const foldedCache = new WeakMap();
+const foldedMessage = (m) => {
+  let f = foldedCache.get(m);
+  if (f === undefined) {
+    f = fold((m.type === "announcement" ? "Moderator" : m.author || "") + "\n" + m.text);
+    foldedCache.set(m, f);
+  }
+  return f;
+};
+const SEARCH_MIN = 2,
+  SEARCH_MAX = 100,
+  SEARCH_RESULTS = 50,
+  SEARCH_COUNT_LIMIT = 1000,
+  SEARCH_INTERVAL_MS = 700;
+// Published public messages of an event that match all terms, newest first.
+function searchPublic(slug, terms, limit = SEARCH_RESULTS) {
+  const rows = eventMessages(slug),
+    results = [];
+  let total = 0;
+  for (let i = rows.length - 1; i >= 0 && total < SEARCH_COUNT_LIMIT; i--) {
+    const m = rows[i];
+    if (m.visibility !== "public" || m.status !== "published") continue;
+    const f = foldedMessage(m);
+    if (!terms.every((t) => f.includes(t))) continue;
+    total++;
+    if (results.length < limit) results.push(publicView(m));
+  }
+  return { results, total, more: total >= SEARCH_COUNT_LIMIT };
+}
 function roomRateAllowed(slug) {
   const now = Date.now(),
     recentTimes = (roomRate.get(slug) || []).filter((t) => now - t < 1000);
@@ -1059,6 +1099,7 @@ function sweep() {
   for (const [key, entry] of idempotency)
     if (!entry.pending && now - entry.at > IDEMPOTENCY_MS) idempotency.delete(key);
   for (const [key, t] of userRate) if (now - t > 10000) userRate.delete(key);
+  for (const [key, t] of searchRate) if (now - t > 10000) searchRate.delete(key);
   for (const [slug, times] of roomRate) if (!times.some((t) => now - t < 1000)) roomRate.delete(slug);
   for (const [key, f] of loginFailures) if (now - f.first > LOGIN_WINDOW_MS) loginFailures.delete(key);
   for (const [slug, r] of rooms)
@@ -1641,6 +1682,39 @@ const server = http.createServer(async (req, res) => {
             createdAt: m.createdAt,
           },
         });
+      }
+
+      // GET /search?q=… — published public messages only (the same messages
+      // every attendee can already see), newest first, at most 50. Needs an
+      // attendee session; one search per session per 0.7 s; refused while the
+      // server is overloaded so live delivery always comes first.
+      if (action === "search" && req.method === "GET") {
+        const g = guestFromRequest(req, slug);
+        if (!g) return send(res, 401, { error: "Session expired." });
+        if (participantIsBanned(slug, g.participantId) || ipIsBanned(slug, g.ipHash))
+          return send(res, 403, { error: "You do not have access to this chat." });
+        const q = String(url.searchParams.get("q") || "").trim(),
+          terms = searchTerms(q);
+        if (q.length > SEARCH_MAX || terms.join("").length < SEARCH_MIN)
+          return send(res, 400, { error: "Enter at least 2 characters to search." });
+        if (currentLagMs() > OVERLOAD_LAG_MS)
+          return send(
+            res,
+            503,
+            { error: "This chat is busy. Please try again shortly.", retryAfter: 2 },
+            { "retry-after": "2" },
+          );
+        const now = Date.now();
+        if (now - (searchRate.get(g.key) || 0) < SEARCH_INTERVAL_MS)
+          return send(
+            res,
+            429,
+            { error: "Please wait a moment before searching again.", retryAfter: 1 },
+            { "retry-after": "1" },
+          );
+        searchRate.set(g.key, now);
+        metrics.inc("search");
+        return send(res, 200, searchPublic(slug, terms));
       }
 
       // ---- Staff endpoints -----------------------------------------------------

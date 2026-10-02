@@ -19,8 +19,9 @@ test("each language column is the right language (regression: NL showed German)"
 
 test("translated text is never translated a second time", () => {
   const nl = createTranslator("nl");
-  // Dutch "of" means "or"; it must not be touched by any other key.
-  assert.equal(nl("Search names or messages"), "Zoek namen of berichten");
+  // The Dutch result contains words that are also English keys ("in");
+  // translation happens in one pass, so they are left alone.
+  assert.equal(nl("Search messages, names and topics…"), "Zoeken in berichten, namen en onderwerpen…");
   assert.equal(nl("Enter a valid email address."), "Vul een geldig e-mailadres in.");
 });
 

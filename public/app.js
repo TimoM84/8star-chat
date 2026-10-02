@@ -4,6 +4,57 @@ const esc = (s) =>
     /[&<>"']/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
   );
+// ---- Search helpers ----------------------------------------------------------
+// Case- and accent-insensitive ("cafe" finds "Café"); every word of the query
+// must occur. The same rules are used by the server for the public chat.
+const fold = (s) =>
+  String(s ?? "")
+    .normalize("NFD")
+    .replace(/\p{M}+/gu, "")
+    .toLowerCase();
+const searchTerms = (q) => [...new Set(fold(q).split(/\s+/).filter(Boolean))].slice(0, 8);
+const matchesAll = (terms, ...fields) => {
+  if (!terms.length) return true;
+  const hay = fold(fields.filter(Boolean).join("\n"));
+  return terms.every((t) => hay.includes(t));
+};
+// Escaped HTML of `text` with every occurrence of a term wrapped in <mark>.
+const highlight = (text, terms) => {
+  const raw = String(text ?? "");
+  if (!terms?.length) return esc(raw);
+  // Folded copy of the text plus, per folded character, its range in `raw`.
+  let folded = "";
+  const from = [],
+    to = [];
+  let pos = 0;
+  for (const ch of raw) {
+    for (const c of fold(ch)) {
+      folded += c;
+      from.push(pos);
+      to.push(pos + ch.length);
+    }
+    pos += ch.length;
+  }
+  const ranges = [];
+  for (const t of terms) {
+    let i = folded.indexOf(t);
+    while (t && i !== -1) {
+      ranges.push([from[i], to[i + t.length - 1]]);
+      i = folded.indexOf(t, i + t.length);
+    }
+  }
+  if (!ranges.length) return esc(raw);
+  ranges.sort((a, b) => a[0] - b[0]);
+  let out = "",
+    last = 0;
+  for (const [a, b] of ranges) {
+    if (b <= last) continue;
+    const start = Math.max(a, last);
+    out += esc(raw.slice(last, start)) + "<mark>" + esc(raw.slice(start, b)) + "</mark>";
+    last = b;
+  }
+  return out + esc(raw.slice(last));
+};
 // CSRF token of the current staff or attendee session. Kept in memory only.
 let csrfToken = "";
 // opts.timeoutMs aborts a request that gets no answer; the error then has
@@ -83,12 +134,28 @@ const route = () => {
     slug: parts[1] ? decodeURIComponent(parts[1]) : "",
   };
 };
+// Theme: light, dark or auto (follows the device). An embedding page can pass
+// ?theme=light|dark|auto (and ?lang=en|nl|de|fr, see i18n.js); the choice is
+// remembered, and the Dark/Light mode button still overrides it.
 const themeKey = "8star-theme",
+  darkQuery = window.matchMedia?.("(prefers-color-scheme: dark)"),
+  resolveTheme = (t) =>
+    t === "auto" ? (darkQuery?.matches ? "dark" : "light") : t === "dark" ? "dark" : "light",
   setTheme = (theme) => {
-    document.documentElement.dataset.theme = theme;
+    document.documentElement.dataset.theme = resolveTheme(theme);
     storage.set("localStorage", themeKey, theme);
   };
-setTheme(storage.get("localStorage", themeKey) || "light");
+{
+  const requested = new URLSearchParams(location.search).get("theme");
+  setTheme(
+    ["light", "dark", "auto"].includes(requested)
+      ? requested
+      : storage.get("localStorage", themeKey) || "light",
+  );
+  darkQuery?.addEventListener?.("change", () => {
+    if (storage.get("localStorage", themeKey) === "auto") setTheme("auto");
+  });
+}
 document.addEventListener("click", (ev) => {
   const b = ev.target.closest("#theme-toggle");
   if (b) {
@@ -418,13 +485,13 @@ async function publicPage(s) {
     esc(event.title) +
     '</b><div class="muted chat-meta">' +
     (readOnly ? "Read-only · You can view the live chat" : "Public chat · " + modeName(event.mode)) +
-    "</div></div>" +
+    '</div></div><div class="chat-actions"><button type="button" class="icon-button" id="search-toggle" aria-expanded="false" aria-controls="chat-search" aria-label="Search messages" title="Search messages"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg></button>' +
     (privateEnabled
       ? '<a class="to-moderator" href="/private/' +
         encodeURIComponent(s) +
         '" data-nav title="Private message to the moderators">To moderator</a>'
       : "") +
-    '</div><div class="chat-subbar">' +
+    '</div></div><form class="chat-search" id="chat-search" role="search" hidden><input type="search" name="q" maxlength="100" autocomplete="off" enterkeyhint="search" aria-label="Search messages" placeholder="Search messages…"><button type="button" class="secondary small" id="close-search">Close</button></form><div class="chat-subbar">' +
     window.chatI18n.picker() +
     '<span class="pill" id="capacity">Live chat</span>' +
     (readOnly
@@ -432,30 +499,148 @@ async function publicPage(s) {
       : '<span class="chat-identity muted">Signed in as <b data-user-content>' +
         esc(session.name) +
         '</b></span><button type="button" class="link-button" id="leave-chat">Not you? Leave chat</button>') +
-    '</div><div class="pinned-messages" id="pinned-messages"></div><div class="messages" id="messages" aria-live="polite"></div>' +
+    '</div><div class="pinned-messages" id="pinned-messages"></div><div class="chat-body"><div class="messages" id="messages" aria-live="polite"></div><div class="messages search-results" id="search-results" aria-live="polite" hidden></div><button type="button" class="jump-latest" id="jump-latest" hidden><span>New messages</span> <b id="jump-count"></b></button></div>' +
     (!readOnly
       ? '<div class="notice" id="notice"></div><form class="composer" id="send"><input name="text" maxlength="500" autocomplete="off" aria-label="Public message" placeholder="Write a public message…"><button>Send</button></form>'
       : '<div class="notice" id="notice">This event is read-only.</div>') +
     "</main>";
   const publicBox = document.querySelector("#messages"),
     pinBox = document.querySelector("#pinned-messages"),
+    resultsBox = document.querySelector("#search-results"),
+    searchForm = document.querySelector("#chat-search"),
+    searchToggle = document.querySelector("#search-toggle"),
+    jump = document.querySelector("#jump-latest"),
     notice = document.querySelector("#notice");
-  const add = (m) => {
-    if (!m || publicBox.querySelector('[data-id="' + CSS.escape(m.id) + '"]')) return;
-    publicBox.insertAdjacentHTML(
-      "beforeend",
-      '<article class="bubble" data-id="' +
-        esc(m.id) +
-        '"><strong data-user-content>' +
-        esc(m.author || "") +
-        "</strong><p>" +
-        esc(m.text) +
-        "</p><time>" +
-        time(m.createdAt) +
-        "</time></article>",
-    );
-    publicBox.scrollTop = publicBox.scrollHeight;
+  const bubble = (m, terms) =>
+    '<article class="bubble" data-id="' +
+    esc(m.id) +
+    '"><strong data-user-content>' +
+    highlight(m.author || "", terms) +
+    "</strong><p>" +
+    highlight(m.text, terms) +
+    "</p><time>" +
+    time(m.createdAt) +
+    "</time></article>";
+  // The live list follows new messages only while the reader is at the
+  // bottom; someone scrolled up to read keeps their place and gets a
+  // "New messages" button. At most MAX_SHOWN messages stay on the page (older
+  // ones remain findable with search), so a long, busy event stays fast on
+  // phones. While someone reads back, nothing above them is removed (up to
+  // MAX_READING); the list is trimmed when they return to the bottom.
+  const MAX_SHOWN = 300,
+    MAX_READING = 1000;
+  let unseen = 0;
+  const nearBottom = () => publicBox.scrollHeight - publicBox.scrollTop - publicBox.clientHeight < 80;
+  const trim = (limit, keepPlace) => {
+    while (publicBox.children.length > limit) {
+      const first = publicBox.firstElementChild,
+        h = first.offsetHeight;
+      first.remove();
+      if (keepPlace) publicBox.scrollTop -= h;
+    }
   };
+  const toBottom = () => {
+    trim(MAX_SHOWN, false);
+    publicBox.scrollTop = publicBox.scrollHeight;
+    unseen = 0;
+    jump.hidden = true;
+  };
+  publicBox.addEventListener("scroll", () => {
+    if (nearBottom() && unseen) toBottom();
+  });
+  jump.addEventListener("click", toBottom);
+  const add = (m, initial = false) => {
+    if (!m || publicBox.querySelector('[data-id="' + CSS.escape(m.id) + '"]')) return;
+    const follow = initial || nearBottom();
+    publicBox.insertAdjacentHTML("beforeend", bubble(m));
+    if (follow) toBottom();
+    else {
+      trim(MAX_READING, true);
+      unseen++;
+      document.querySelector("#jump-count").textContent = unseen > 99 ? "99+" : String(unseen);
+      jump.hidden = false;
+    }
+  };
+  // ---- Search in all published messages of this event (server side) ----
+  let searchSeq = 0,
+    searchTimer = null;
+  const showLive = () => {
+    resultsBox.hidden = true;
+    resultsBox.innerHTML = "";
+    publicBox.hidden = false;
+    pinBox.classList.remove("searching");
+    toBottom();
+  };
+  const runSearch = async (q, seq, retried = false) => {
+    const terms = searchTerms(q);
+    try {
+      const d = await guestApi(s, "search?q=" + encodeURIComponent(q), { timeoutMs: 10000 });
+      if (seq !== searchSeq) return;
+      resultsBox.innerHTML =
+        '<div class="search-summary"><span>Search results</span> <span class="pill">' +
+        (d.more ? d.total.toLocaleString() + "+" : d.total.toLocaleString()) +
+        "</span>" +
+        (d.total > d.results.length ? '<div class="hint">Showing the 50 most recent results.</div>' : "") +
+        "</div>" +
+        (d.results.length
+          ? d.results.map((m) => bubble(m, terms)).join("")
+          : '<div class="empty">No messages found.</div>');
+      resultsBox.scrollTop = 0;
+    } catch (e) {
+      if (seq !== searchSeq) return;
+      if (e.status === 429 && !retried) {
+        await sleep(800);
+        if (seq === searchSeq) return runSearch(q, seq, true);
+        return;
+      }
+      if (e.status === 401) return render();
+      resultsBox.innerHTML = '<div class="empty">' + esc(e.message) + "</div>";
+    }
+  };
+  const onSearchInput = () => {
+    const q = searchForm.elements.q.value.trim(),
+      seq = ++searchSeq;
+    clearTimeout(searchTimer);
+    if (searchTerms(q).join("").length < 2) {
+      if (q) {
+        publicBox.hidden = true;
+        resultsBox.hidden = false;
+        pinBox.classList.add("searching");
+        resultsBox.innerHTML = '<div class="empty">Type at least 2 characters.</div>';
+      } else showLive();
+      return;
+    }
+    publicBox.hidden = true;
+    resultsBox.hidden = false;
+    pinBox.classList.add("searching");
+    jump.hidden = true;
+    searchTimer = setTimeout(() => runSearch(q, seq), 300);
+  };
+  const closeSearch = () => {
+    searchSeq++;
+    clearTimeout(searchTimer);
+    searchForm.reset();
+    searchForm.hidden = true;
+    searchToggle.setAttribute("aria-expanded", "false");
+    searchForm.closest(".chat-shell").classList.remove("search-open");
+    showLive();
+  };
+  searchToggle.addEventListener("click", () => {
+    if (!searchForm.hidden) return closeSearch();
+    searchForm.hidden = false;
+    searchToggle.setAttribute("aria-expanded", "true");
+    searchForm.closest(".chat-shell").classList.add("search-open");
+    searchForm.elements.q.focus();
+  });
+  searchForm.elements.q.addEventListener("input", onSearchInput);
+  searchForm.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    onSearchInput();
+  });
+  searchForm.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") closeSearch();
+  });
+  document.querySelector("#close-search").addEventListener("click", closeSearch);
   const renderPins = (pins) => {
     const valid = (pins || []).slice(0, 5);
     pinBox.hidden = !valid.length;
@@ -472,8 +657,9 @@ async function publicPage(s) {
       )
       .join("");
   };
-  (session.history || []).forEach(add);
+  (session.history || []).forEach((m) => add(m, true));
   renderPins(event.pinnedMessages);
+  let firstReady = true;
   document.querySelector("#leave-chat")?.addEventListener("click", async () => {
     stopStream();
     await leaveChat(s);
@@ -496,6 +682,9 @@ async function publicPage(s) {
           ? "Your message is now public."
           : "Your message is awaiting moderator approval.";
       input.value = "";
+      // Sending means you want to see the conversation: back to the latest.
+      if (publicBox.hidden) closeSearch();
+      else toBottom();
     } catch (e) {
       notice.textContent = e.message;
       if (e.status === 401) setTimeout(() => render(), 1500);
@@ -519,15 +708,19 @@ async function publicPage(s) {
     {
       ready: (ev) => {
         const d = JSON.parse(ev.data);
-        (d.history || []).forEach(add);
+        (d.history || []).forEach((m) => add(m, firstReady));
+        firstReady = false;
         renderPins(d.pins || []);
         document.querySelector("#capacity").textContent = d.connections.toLocaleString() + " connected";
         if (notice.textContent === window.chatI18n.text("Reconnecting…")) notice.textContent = "";
       },
       public: (ev) => add(JSON.parse(ev.data)),
       pins: (ev) => renderPins(JSON.parse(ev.data)),
-      remove: (ev) =>
-        publicBox.querySelector('[data-id="' + CSS.escape(JSON.parse(ev.data).id) + '"]')?.remove(),
+      remove: (ev) => {
+        const sel = '[data-id="' + CSS.escape(JSON.parse(ev.data).id) + '"]';
+        publicBox.querySelector(sel)?.remove();
+        resultsBox.querySelector(sel)?.remove();
+      },
       settings: (ev) => {
         const d = JSON.parse(ev.data);
         if ((d.privateMessagesEnabled !== false) !== privateEnabled || d.mode !== event.mode) render();
@@ -800,8 +993,22 @@ async function moderatorPage(event, me) {
   } catch {}
   let tab = "inbox",
     privateStatus = "open",
-    privateSearch = "",
-    privatePage = 0;
+    privatePage = 0,
+    query = "",
+    terms = [];
+  // Long lists are shown in steps, so a busy event stays quick on an iPad.
+  const STEP = 50,
+    shown = { inbox: STEP, archive: STEP };
+  const moreButton = (list, total) =>
+    total > shown[list]
+      ? '<div class="show-more"><button type="button" class="secondary" data-more="' +
+        list +
+        '">Show more</button><span class="muted">' +
+        shown[list].toLocaleString() +
+        " / " +
+        total.toLocaleString() +
+        "</span></div>"
+      : "";
   const privateOpen = new Set(),
     isPlatformAdmin = me.role === "owner",
     isOwner = canManage;
@@ -820,7 +1027,30 @@ async function moderatorPage(event, me) {
     esc(roleName(me.role)) +
     '</div></div><div class="stats"><div class="stat">Limit ' +
     event.capacity.toLocaleString() +
-    '</div></div></div><div class="tabs"><button class="tab active" data-tab="inbox">Inbox</button><button class="tab" data-tab="private">Private messages</button><button class="tab" data-tab="archive">Published / archive</button><button class="tab" data-tab="stage">Stage / cues</button><button class="tab" data-tab="team">Team</button><button class="tab" data-tab="bans">Blocked users</button><button class="tab" data-tab="settings">Settings</button></div><div id="panel"></div></main>';
+    '</div></div></div><div class="console-nav"><div class="tabs" role="tablist">' +
+    [
+      ["inbox", "Inbox"],
+      ["private", "Private messages"],
+      ["archive", "Published / archive"],
+      ["stage", "Stage / cues"],
+      ["team", "Team"],
+      ["bans", "Blocked users"],
+      ["settings", "Settings"],
+    ]
+      .map(
+        ([id, label]) =>
+          '<button class="tab' +
+          (id === "inbox" ? " active" : "") +
+          '" role="tab" data-tab="' +
+          id +
+          '"><span>' +
+          label +
+          '</span><span class="tab-count" data-count="' +
+          id +
+          '" hidden></span></button>',
+      )
+      .join("") +
+    '</div><div class="console-search" role="search"><input type="search" id="console-search" autocomplete="off" enterkeyhint="search" aria-label="Search messages, names and topics" placeholder="Search messages, names and topics…"></div></div><div id="panel"></div></main>';
   document.querySelector("#logout").onclick = async () => {
     await api("/api/logout", { method: "POST", body: "{}" });
     csrfToken = "";
@@ -879,7 +1109,7 @@ async function moderatorPage(event, me) {
           .join("") +
         '</select></div><button class="secondary small" data-act="assign">Save assignment</button></div>'
       : '<div class="muted assignment-summary">' +
-        (m.topic ? "<span data-user-content>" + esc(m.topic) + "</span> · " : "") +
+        (m.topic ? "<span data-user-content>" + highlight(m.topic, terms) + "</span> · " : "") +
         esc(personName(m.assignedTo)) +
         "</div>";
     const buttons =
@@ -889,16 +1119,16 @@ async function moderatorPage(event, me) {
     return (
       '<article class="question" data-q="' +
       esc(m.id) +
-      '"><div class="row"><b><span data-user-content>' +
-      esc(m.author) +
+      '"><div class="question-head"><b><span data-user-content>' +
+      highlight(m.author, terms) +
       "</span>" +
-      (m.language ? '<span class="pill" data-user-content>' + esc(m.language) + "</span>" : "") +
+      (m.language ? ' <span class="pill" data-user-content>' + esc(m.language) + "</span>" : "") +
       ' <span class="pill">' +
       (m.type === "private" ? "Private" : "Public") +
       '</span></b><span class="muted">' +
       time(m.createdAt) +
       "</span></div><p>" +
-      esc(m.text) +
+      highlight(m.text, terms) +
       "</p>" +
       routing +
       '<div class="question-actions">' +
@@ -1026,7 +1256,7 @@ async function moderatorPage(event, me) {
     }
     return (
       '<article class="team-member"><div class="row"><div><b data-user-content>' +
-      esc(u.email) +
+      highlight(u.email, terms) +
       '</b></div><span class="pill">' +
       esc(roleName(u.role)) +
       (u.active ? "" : " · Disabled") +
@@ -1038,11 +1268,62 @@ async function moderatorPage(event, me) {
       "</article>"
     );
   };
+  // What each tab lists, filtered by the search query.
+  const hit = (m) => matchesAll(terms, m.author, m.text, m.topic, m.language);
+  const lists = {
+    inbox: () => messages.filter((m) => m.status === "pending" && m.type === "question" && hit(m)),
+    private: () =>
+      privateThreads().filter(
+        (t) =>
+          (privateStatus === "all" || t.status === privateStatus) &&
+          (!terms.length ||
+            matchesAll(
+              terms,
+              t.messages.find((m) => m.participantId === t.id)?.author,
+              ...t.messages.map((m) => m.text),
+            )),
+      ),
+    archive: () =>
+      messages.filter(
+        (m) => ["published", "withdrawn"].includes(m.status) && m.type === "question" && hit(m),
+      ),
+    announcements: () => pins.filter((m) => m.type === "announcement" && hit(m)),
+    stage: () => messages.filter((m) => m.stageState === "queued" && hit(m)),
+    replies: () => messages.filter((m) => m.type === "stage-reply" && hit(m)),
+    team: () => team.filter((u) => matchesAll(terms, u.email, roleName(u.role), ...(u.topics || []))),
+    bans: () => bans.filter((b) => matchesAll(terms, b.name, b.by)),
+  };
+  const tabCounts = () => {
+    const counts = terms.length
+      ? {
+          inbox: lists.inbox().length,
+          private: lists.private().length,
+          archive: lists.archive().length + lists.announcements().length,
+          stage: lists.stage().length + lists.replies().length,
+          team: lists.team().length,
+          bans: lists.bans().length,
+        }
+      : {
+          inbox: lists.inbox().length,
+          private: privateThreads().filter((t) => t.status === "open").length,
+        };
+    document.querySelectorAll("[data-count]").forEach((el) => {
+      const n = counts[el.dataset.count];
+      el.hidden = n === undefined || (!terms.length && !n);
+      el.textContent = n > 999 ? "999+" : String(n ?? "");
+    });
+    document.querySelector(".console-nav").classList.toggle("searching", terms.length > 0);
+  };
   const draw = () => {
-    document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === tab));
+    document.querySelectorAll(".tab").forEach((x) => {
+      x.classList.toggle("active", x.dataset.tab === tab);
+      x.setAttribute("aria-selected", String(x.dataset.tab === tab));
+    });
+    document.querySelector(".console-search").hidden = tab === "settings";
+    tabCounts();
     const p = document.querySelector("#panel");
     if (tab === "inbox") {
-      const pending = messages.filter((m) => m.status === "pending" && m.type === "question");
+      const pending = lists.inbox();
       p.innerHTML =
         '<section class="card"><h2>Moderation queue <span class="pill">' +
         pending.length +
@@ -1055,21 +1336,17 @@ async function moderatorPage(event, me) {
             "</datalist>"
           : "") +
         '<div class="queue">' +
-        (pending.map(questionCard).join("") || '<div class="empty">No messages to review.</div>') +
-        '</div><p class="hint">Publish to the public chat, or send a question to the speaker queue. Published questions remain in the archive.</p></section>';
+        (pending.slice(0, shown.inbox).map(questionCard).join("") ||
+          (terms.length
+            ? '<div class="empty">No matching messages.</div>'
+            : '<div class="empty">No messages to review.</div>')) +
+        "</div>" +
+        moreButton("inbox", pending.length) +
+        '<p class="hint">Publish to the public chat, or send a question to the speaker queue. Published questions remain in the archive.</p></section>';
       wireMessages(p);
     } else if (tab === "private") {
       const threads = privateThreads(),
-        needle = privateSearch.trim().toLocaleLowerCase(),
-        filtered = threads.filter(
-          (t) =>
-            (privateStatus === "all" || t.status === privateStatus) &&
-            (!needle ||
-              [t.messages[0]?.author, ...t.messages.map((m) => m.text)]
-                .join(" ")
-                .toLocaleLowerCase()
-                .includes(needle)),
-        ),
+        filtered = lists.private(),
         pageSize = 20,
         pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
       privatePage = Math.min(privatePage, pageCount - 1);
@@ -1082,9 +1359,9 @@ async function moderatorPage(event, me) {
           '<details class="private-thread-card" data-thread-card="' +
           esc(t.id) +
           '" ' +
-          (privateOpen.has(t.id) ? "open" : "") +
+          (privateOpen.has(t.id) || (terms.length && filtered.length <= 5) ? "open" : "") +
           '><summary class="private-thread-summary"><div class="private-summary-main"><b data-user-content>' +
-          esc(attendee) +
+          highlight(attendee, terms) +
           '</b><span class="muted">' +
           esc(statusName(t.status)) +
           " · " +
@@ -1092,7 +1369,7 @@ async function moderatorPage(event, me) {
           " messages · " +
           time(last.createdAt) +
           '</span><span class="thread-preview" data-user-content>' +
-          esc(last.text) +
+          highlight(last.text, terms) +
           '</span></div></summary><div class="private-thread-content"><div class="muted">Last message by <span data-user-content>' +
           esc(who) +
           '</span></div><div class="private-transcript">' +
@@ -1104,7 +1381,7 @@ async function moderatorPage(event, me) {
                 '"><b data-user-content>' +
                 esc(m.author || "Attendee") +
                 "</b><p>" +
-                esc(m.text) +
+                highlight(m.text, terms) +
                 "</p><time>" +
                 time(m.createdAt) +
                 "</time></div>",
@@ -1140,9 +1417,7 @@ async function moderatorPage(event, me) {
         statusName("closed") +
         '</option><option value="all" ' +
         (privateStatus === "all" ? "selected" : "") +
-        '>All conversations</option></select><input id="private-search" value="' +
-        esc(privateSearch) +
-        '" placeholder="Search names or messages"></div><div class="private-inbox">' +
+        '>All conversations</option></select></div><div class="private-inbox">' +
         (visible.map(threadCard).join("") || '<div class="empty">No matching private conversations.</div>') +
         "</div>" +
         (filtered.length > pageSize
@@ -1164,16 +1439,6 @@ async function moderatorPage(event, me) {
         privateStatus = select.value;
         privatePage = 0;
         draw();
-      };
-      const search = p.querySelector("#private-search");
-      search.oninput = () => {
-        const position = search.selectionStart;
-        privateSearch = search.value;
-        privatePage = 0;
-        draw();
-        const next = p.querySelector("#private-search");
-        next.focus();
-        next.setSelectionRange(position, position);
       };
       p.querySelectorAll("[data-private-page]").forEach(
         (button) =>
@@ -1229,27 +1494,37 @@ async function moderatorPage(event, me) {
           }),
       );
     } else if (tab === "archive") {
-      const archived = messages.filter(
-          (m) => ["published", "withdrawn"].includes(m.status) && m.type === "question",
-        ),
-        announcementPins = pins.filter((m) => m.type === "announcement");
-      p.innerHTML =
-        '<section class="card"><h2>Pinned announcements</h2><p class="muted">Write an announcement to pin at the top of the public chat.</p><form id="announcement-form" class="announcement-form"><textarea name="text" maxlength="500" required placeholder="Announcement text…"></textarea><label class="announcement-color">Pin color <input type="color" name="color" value="#111111"></label><button>Post and pin announcement</button><div class="error" id="announcement-error"></div></form><div class="queue">' +
-        (announcementPins
+      const archived = lists.archive(),
+        announcementPins = lists.announcements();
+      // While searching, only matching announcements are listed (no form), so
+      // the results are at the top.
+      const searching = terms.length > 0;
+      const announcementList =
+        announcementPins
           .map(
             (m) =>
-              '<article class="question announcement-item"><div class="row"><b data-user-content>' +
+              '<article class="question announcement-item"><div class="question-head"><b data-user-content>' +
               esc(m.author || "Moderator") +
               '</b><span class="muted">' +
               time(m.createdAt) +
               "</span></div><p data-user-content>" +
-              esc(m.text) +
+              highlight(m.text, terms) +
               '</p><button class="secondary small" type="button" data-unpin-announcement="' +
               esc(m.id) +
               '">Unpin</button></article>',
           )
-          .join("") || '<div class="empty">No pinned announcements.</div>') +
-        '</div></section><section class="card"><div class="row"><div><h2>Published questions and archive</h2><p class="muted">Withdraw, republish, send questions to speakers, pin key messages, and manage participant access.</p></div><a href="' +
+          .join("") || '<div class="empty">No pinned announcements.</div>';
+      p.innerHTML =
+        (searching && !announcementPins.length
+          ? ""
+          : '<section class="card"><h2>Pinned announcements</h2>' +
+            (searching
+              ? ""
+              : '<p class="muted">Write an announcement to pin at the top of the public chat.</p><form id="announcement-form" class="announcement-form"><textarea name="text" maxlength="500" required placeholder="Announcement text…"></textarea><label class="announcement-color">Pin color <input type="color" name="color" value="#111111"></label><button>Post and pin announcement</button><div class="error" id="announcement-error"></div></form>') +
+            '<div class="queue">' +
+            announcementList +
+            "</div></section>") +
+        '<section class="card"><div class="section-head"><div><h2>Published questions and archive</h2><p class="muted">Withdraw, republish, send questions to speakers, pin key messages, and manage participant access.</p></div><a href="' +
         endpoint +
         '/export"><button class="secondary">Export full chat CSV</button></a></div>' +
         (isOwner
@@ -1263,12 +1538,13 @@ async function moderatorPage(event, me) {
         (archived
           .slice()
           .reverse()
+          .slice(0, shown.archive)
           .map(
             (m) =>
               '<article class="question" data-q="' +
               esc(m.id) +
-              '"><div class="row"><b><span data-user-content>' +
-              esc(m.author) +
+              '"><div class="question-head"><b><span data-user-content>' +
+              highlight(m.author, terms) +
               "</span> " +
               (m.language ? '<span class="pill" data-user-content>' + esc(m.language) + "</span>" : "") +
               ' <span class="pill">' +
@@ -1278,7 +1554,7 @@ async function moderatorPage(event, me) {
               '</b><span class="muted">' +
               time(m.createdAt) +
               "</span></div><p>" +
-              esc(m.text) +
+              highlight(m.text, terms) +
               '</p><div class="question-actions">' +
               (m.status === "published"
                 ? '<button class="secondary small" data-act="withdraw">Withdraw from public chat</button>'
@@ -1291,23 +1567,30 @@ async function moderatorPage(event, me) {
               pinControls(m) +
               "</article>",
           )
-          .join("") || '<div class="empty">No published messages yet.</div>') +
-        "</div></section>";
-      document.querySelector("#announcement-form").onsubmit = async (ev) => {
-        ev.preventDefault();
-        const input = ev.target.elements.text;
-        if (!input.value.trim()) return;
-        try {
-          await api(endpoint + "/announcements", {
-            method: "POST",
-            body: JSON.stringify({ text: input.value, color: ev.target.elements.color.value }),
-          });
-          await refresh();
-          draw();
-        } catch (e) {
-          document.querySelector("#announcement-error").textContent = e.message;
-        }
-      };
+          .join("") ||
+          (terms.length
+            ? '<div class="empty">No matching messages.</div>'
+            : '<div class="empty">No published messages yet.</div>')) +
+        "</div>" +
+        moreButton("archive", archived.length) +
+        "</section>";
+      const announcementForm = document.querySelector("#announcement-form");
+      if (announcementForm)
+        announcementForm.onsubmit = async (ev) => {
+          ev.preventDefault();
+          const input = ev.target.elements.text;
+          if (!input.value.trim()) return;
+          try {
+            await api(endpoint + "/announcements", {
+              method: "POST",
+              body: JSON.stringify({ text: input.value, color: ev.target.elements.color.value }),
+            });
+            await refresh();
+            draw();
+          } catch (e) {
+            document.querySelector("#announcement-error").textContent = e.message;
+          }
+        };
       p.querySelectorAll("[data-unpin-announcement]").forEach(
         (button) =>
           (button.onclick = async () => {
@@ -1324,14 +1607,14 @@ async function moderatorPage(event, me) {
       );
       wireMessages(p);
     } else if (tab === "stage") {
-      const replies = messages
-          .filter((m) => m.type === "stage-reply")
+      const replies = lists
+          .replies()
           .slice(-30)
           .reverse()
           .map(
             (m) =>
               '<div class="question"><p>' +
-              esc(m.text) +
+              highlight(m.text, terms) +
               '</p><span class="muted"><span data-user-content>' +
               esc(m.author) +
               "</span> · " +
@@ -1339,7 +1622,7 @@ async function moderatorPage(event, me) {
               "</span></div>",
           )
           .join(""),
-        queued = messages.filter((m) => m.stageState === "queued");
+        queued = lists.stage();
       p.innerHTML =
         '<div class="split"><section class="card"><h2>Speaker queue <span class="pill">' +
         queued.length +
@@ -1352,7 +1635,7 @@ async function moderatorPage(event, me) {
               '"><span class="pill">' +
               (m.type === "cue" ? "Stage cue" : "Question") +
               "</span><p>" +
-              esc(m.text) +
+              highlight(m.text, terms) +
               '</p><button class="danger small" data-act="stage-remove">Remove from speaker queue</button></article>',
           )
           .join("") || '<div class="empty">Nothing waiting for the speaker.</div>') +
@@ -1410,7 +1693,10 @@ async function moderatorPage(event, me) {
             '</select><label>Topics / areas for this moderator</label><input name="topics" placeholder="Delta works, Infrastructure"><div class="hint">Comma-separated. The event owner can assign questions to the moderator responsible for each area.</div><button style="margin-top:12px">Add account</button><div class="error" id="user-error"></div></form>'
           : '<p class="muted">The event owner manages accounts and topic responsibilities.</p>') +
         '</section><section class="card"><h2>Team accounts</h2><div id="team-list">' +
-        (team.map(teamCard).join("") || '<div class="empty">No team accounts yet.</div>') +
+        (lists.team().map(teamCard).join("") ||
+          (terms.length
+            ? '<div class="empty">No matching accounts.</div>'
+            : '<div class="empty">No team accounts yet.</div>')) +
         "</div></section></div>";
       document.querySelector("#add-user")?.addEventListener("submit", async (ev) => {
         ev.preventDefault();
@@ -1485,11 +1771,12 @@ async function moderatorPage(event, me) {
           ? "IP blocking is enabled through the proxy."
           : "IP blocking is unavailable until TRUST_PROXY is enabled for the reverse proxy.") +
         '</p><div class="queue">' +
-        (bans
+        (lists
+          .bans()
           .map(
             (b) =>
               '<article class="team-member"><div class="row"><div><b data-user-content>' +
-              esc(b.name) +
+              highlight(b.name, terms) +
               "</b>" +
               (b.kind === "ip" ? " · IP address" : " · User") +
               '<div class="muted"><span>Blocked</span> ' +
@@ -1502,7 +1789,10 @@ async function moderatorPage(event, me) {
               esc(b.id) +
               '">Unblock user</button></div></article>',
           )
-          .join("") || '<div class="empty">No blocked users.</div>') +
+          .join("") ||
+          (terms.length
+            ? '<div class="empty">No matching blocked users.</div>'
+            : '<div class="empty">No blocked users.</div>')) +
         "</div></section>";
       p.querySelectorAll("[data-unblock]").forEach(
         (button) =>
@@ -1588,8 +1878,27 @@ async function moderatorPage(event, me) {
       (b.onclick = () => {
         tab = b.dataset.tab;
         draw();
+        b.scrollIntoView({ block: "nearest", inline: "nearest" });
       }),
   );
+  document.querySelector("#panel").addEventListener("click", (ev) => {
+    const more = ev.target.closest("[data-more]");
+    if (!more) return;
+    shown[more.dataset.more] += STEP;
+    draw();
+  });
+  const searchInput = document.querySelector("#console-search");
+  let searchTimer = null;
+  searchInput.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      query = searchInput.value;
+      terms = searchTerms(query);
+      shown.inbox = shown.archive = STEP;
+      privatePage = 0;
+      draw();
+    }, 150);
+  });
   draw();
   // Realtime updates are coalesced: a burst of events triggers one reload
   // instead of one full reload per event. While a moderator is typing in the
@@ -1666,8 +1975,12 @@ async function stagePage(event, me, access) {
     window.chatI18n.picker() +
     '<button class="secondary small" id="theme-toggle">' +
     (document.documentElement.dataset.theme === "dark" ? "Light mode" : "Dark mode") +
-    '</button></div></header><div class="stage-layout"><section class="stage-current card"><div class="row"><h2>Selected question</h2><span class="pill" id="stage-count">0 waiting</span></div><div id="stage-now"><div class="empty">Select a question from the queue.</div></div><form class="stage-reply" id="reply"><input name="text" placeholder="Private message to moderators…" maxlength="500"><button>Send</button></form></section><section class="stage-queue-panel card"><div class="row"><div><h2>Questions to read</h2><p class="muted">Tap a question to display it. Mark it read when you are done.</p></div></div><div class="stage-question-list" id="stage-list"></div></section></div></main>';
-  let currentId = "";
+    '</button></div></header><div class="stage-layout"><section class="stage-current card"><div class="row"><h2>Selected question</h2><span class="pill" id="stage-count">0 waiting</span></div><div id="stage-now"><div class="empty">Select a question from the queue.</div></div><form class="stage-reply" id="reply"><input name="text" placeholder="Private message to moderators…" maxlength="500"><button>Send</button></form></section><section class="stage-queue-panel card"><div class="row"><div><h2>Questions to read</h2><p class="muted">Tap a question to display it. Mark it read when you are done.</p></div></div><input type="search" class="stage-filter" id="stage-filter" autocomplete="off" aria-label="Filter questions" placeholder="Filter questions…"><div class="stage-question-list" id="stage-list"></div></section></div></main>';
+  let filterTerms = [];
+  document.querySelector("#stage-filter").addEventListener("input", (ev) => {
+    filterTerms = searchTerms(ev.target.value);
+    render();
+  });
   const render = () => {
     const current = stage.current,
       currentBox = document.querySelector("#stage-now"),
@@ -1686,8 +1999,9 @@ async function stagePage(event, me, access) {
         esc(current.id) +
         '">I’ve read this</button></div>'
       : '<div class="empty">Select a question from the queue.</div>';
-    list.innerHTML = stage.queue.length
-      ? stage.queue
+    const visible = stage.queue.filter((m) => matchesAll(filterTerms, m.text, m.author));
+    list.innerHTML = visible.length
+      ? visible
           .map(
             (m) =>
               '<article class="stage-question-card ' +
@@ -1697,7 +2011,7 @@ async function stagePage(event, me, access) {
               '"><span class="pill">' +
               (m.type === "cue" ? "Cue" : "Question") +
               "</span><span>" +
-              esc(m.text) +
+              highlight(m.text, filterTerms) +
               "</span><small>" +
               time(m.createdAt) +
               '</small></button><button class="secondary stage-read-button" data-read="' +
@@ -1705,7 +2019,9 @@ async function stagePage(event, me, access) {
               '">Mark read</button></article>',
           )
           .join("")
-      : '<div class="empty">All caught up. New selected questions appear here automatically.</div>';
+      : stage.queue.length
+        ? '<div class="empty">No matching questions.</div>'
+        : '<div class="empty">All caught up. New selected questions appear here automatically.</div>';
   };
   document.addEventListener("click", async function stageActions(ev) {
     const show = ev.target.closest("[data-show]"),

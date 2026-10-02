@@ -1096,3 +1096,355 @@ h3 {
     flex: none;
   }
 }
+
+/* ---- Search -------------------------------------------------------------- */
+mark {
+  background: color-mix(in srgb, #f0c000 45%, transparent);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+.chat-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  margin-left: auto;
+}
+/* A small, borderless magnifying glass next to "To moderator". */
+.icon-button {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+}
+.icon-button svg {
+  width: 15px;
+  height: 15px;
+}
+.icon-button:hover,
+.icon-button[aria-expanded="true"] {
+  color: var(--text);
+  opacity: 1;
+}
+.chat-search {
+  display: flex;
+  gap: 8px;
+  padding: 8px 2px 0;
+}
+.chat-search[hidden] {
+  display: none;
+}
+.chat-search input {
+  min-width: 0;
+  padding: 8px 11px;
+}
+.chat-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.chat-body > .messages {
+  min-height: 0;
+}
+.messages[hidden] {
+  display: none;
+}
+.search-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  font-size: 13px;
+  font-weight: 650;
+}
+.search-summary .hint {
+  flex-basis: 100%;
+  font-weight: 400;
+}
+.jump-latest {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  border-radius: 99px;
+  padding: 7px 14px;
+  font-size: 13px;
+  box-shadow: 0 6px 18px #00000030;
+  white-space: nowrap;
+}
+.jump-latest[hidden] {
+  display: none;
+}
+.jump-latest::after {
+  content: " ↓";
+}
+/* Pinned messages never take more than about a third of the chat. */
+.pinned-messages {
+  max-height: min(34%, 240px);
+  overflow: auto;
+  flex: none;
+}
+.pinned-messages.searching {
+  display: none;
+}
+.public-chat {
+  max-width: 900px;
+  margin: 0 auto;
+  width: 100%;
+}
+.chat-shell {
+  min-height: 300px;
+}
+
+/* ---- Moderator console ---------------------------------------------------- */
+.console-nav {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--page);
+  padding: 8px 0 10px;
+  margin-bottom: 4px;
+}
+.console-nav .tabs {
+  margin-bottom: 10px;
+}
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.tab-count {
+  min-width: 22px;
+  padding: 1px 7px;
+  border-radius: 99px;
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+.tab-count[hidden] {
+  display: none;
+}
+.tab.active .tab-count {
+  background: var(--accent-contrast);
+  color: var(--accent);
+  border-color: transparent;
+}
+.console-nav.searching .tab:not(.active) .tab-count:not([hidden]) {
+  border-color: var(--text);
+}
+.console-search[hidden] {
+  display: none;
+}
+.console-search input {
+  max-width: 560px;
+}
+.question-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+.question-head b {
+  overflow-wrap: anywhere;
+}
+.section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+}
+.section-head > div {
+  flex: 1 1 300px;
+}
+/* Lists grow with the page instead of scrolling inside it (no nested
+   scrolling on touch screens); long lists load in steps. */
+.queue {
+  max-height: none;
+  overflow: visible;
+}
+.show-more {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+.private-tools {
+  grid-template-columns: minmax(150px, 280px);
+}
+
+/* ---- Speaker page --------------------------------------------------------- */
+.stage-filter {
+  margin: 4px 0 10px;
+}
+.stage-queue-panel {
+  container-type: inline-size;
+}
+@container (max-width: 440px) {
+  .stage-question-card {
+    grid-template-columns: 1fr;
+  }
+  .stage-read-button {
+    width: 100%;
+  }
+}
+
+/* ---- Touch screens: larger targets, no zoom on focus (iOS zooms into fields
+   with text smaller than 16px) ------------------------------------------- */
+@media (pointer: coarse) {
+  input,
+  select,
+  textarea,
+  .locale-switch select,
+  .chat-search input {
+    font-size: 16px;
+  }
+  button {
+    min-height: 44px;
+  }
+  button.small {
+    min-height: 40px;
+  }
+  .tab {
+    min-height: 44px;
+  }
+  .icon-button {
+    width: 36px;
+    height: 36px;
+    min-height: 0;
+    margin: -5px -4px;
+  }
+  .to-moderator {
+    min-height: 40px;
+    padding: 6px 12px;
+    font-size: 13px;
+  }
+  .link-button {
+    min-height: 32px;
+    padding: 6px 0;
+  }
+  .locale-switch select {
+    height: 40px;
+  }
+  .check-label input,
+  input[type="checkbox"] {
+    width: 22px;
+    height: 22px;
+  }
+  .action-link {
+    min-height: 40px;
+  }
+  .jump-latest {
+    min-height: 40px;
+  }
+}
+
+/* ---- Phones and narrow embeds -------------------------------------------- */
+@media (max-width: 760px) {
+  .dash-head h1 {
+    font-size: clamp(24px, 7vw, 34px);
+  }
+  .console-nav .tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    margin: 0 -14px 10px;
+    padding: 0 14px;
+    scroll-padding: 0 14px;
+  }
+  .console-nav .tabs::-webkit-scrollbar {
+    display: none;
+  }
+  .tab {
+    flex: none;
+    white-space: nowrap;
+  }
+  .console-search input {
+    max-width: none;
+  }
+  .section-head > a,
+  .section-head > a button {
+    width: 100%;
+  }
+  .question-actions button {
+    flex: 1 1 auto;
+  }
+  .stage-top {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .stage-top > .toolbar {
+    justify-content: flex-start;
+  }
+  .stats {
+    display: none;
+  }
+}
+@media (max-width: 420px) {
+  .chat-subbar .locale-switch > span {
+    display: none;
+  }
+  .chat-head b {
+    font-size: 15px;
+  }
+}
+/* Short embeds (e.g. a 360px high iframe): keep the messages visible. */
+@media (max-height: 560px) {
+  .chat-shell {
+    padding: 8px 10px;
+  }
+  .chat-head {
+    padding-bottom: 8px;
+  }
+  .chat-subbar {
+    padding: 5px 2px;
+  }
+  .pinned-messages {
+    max-height: 30%;
+  }
+  .pinned-bubble {
+    padding: 6px 9px;
+  }
+  .messages {
+    padding: 8px 2px;
+  }
+  .notice {
+    padding: 5px;
+  }
+}
+/* While searching, the language/identity line makes room for the results. */
+.chat-shell.search-open .chat-subbar {
+  display: none;
+}
+.chat-shell.search-open .chat-search {
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+/* Speaker page header: title takes the space, tools stay on one line. */
+.stage-top > div:first-child {
+  flex: 1;
+  min-width: 0;
+}
+.stage-top > .toolbar {
+  flex: none;
+}
+/* Speaker page header: title takes the free space, controls stay on one line
+   where they fit. */
+.stage-top > div:first-child {
+  flex: 1;
+  min-width: 0;
+}
